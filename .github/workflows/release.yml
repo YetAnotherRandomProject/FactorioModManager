@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: 0.11.8
 
 jobs:
   package:
@@ -22,25 +23,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Builds natifs : même dossier target/release que la CI, donc même cache.
           - name: windows
             os: windows-latest
             formats: nsis
-            files: target/release/*-setup.exe
+            target: ""
+            out: target/release
           - name: linux
             os: ubuntu-22.04
             formats: appimage,deb
-            files: |
-              target/release/*.AppImage
-              target/release/*.deb
+            target: ""
+            out: target/release
           - name: macos-arm64
             os: macos-latest
             formats: dmg
-            files: target/release/*.dmg
+            target: ""
+            out: target/release
+          # Mac Intel : compilation croisée depuis le runner ARM (les runners Intel sont retirés).
           - name: macos-x64
-            os: macos-13
+            os: macos-latest
             formats: dmg
-            files: target/release/*.dmg
+            target: x86_64-apple-darwin
+            out: target/x86_64-apple-darwin/release
     runs-on: ${{ matrix.os }}
+    env:
+      TARGET_ARG: ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -60,23 +67,51 @@ jobs:
           sudo apt-get install -y libfontconfig1-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev libfuse2 file
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Clé partagée avec la CI : la release réutilise le build release déjà fait sur master.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          key: ${{ matrix.target }}
+
+      - name: Cache cargo-packager
+        id: packager-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-${{ env.CARGO_PACKAGER_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install cargo-packager
-        run: cargo install cargo-packager --locked
+        if: steps.packager-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --locked --version ${{ env.CARGO_PACKAGER_VERSION }}
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked $TARGET_ARG
 
       - name: Build installer
-        run: cargo packager --release --formats ${{ matrix.formats }}
+        shell: bash
+        run: cargo packager --release --formats ${{ matrix.formats }} $TARGET_ARG
 
       - uses: actions/upload-artifact@v4
         with:
           name: installer-${{ matrix.name }}
-          path: ${{ matrix.files }}
+          path: |
+            ${{ matrix.out }}/*-setup.exe
+            ${{ matrix.out }}/*.AppImage
+            ${{ matrix.out }}/*.deb
+            ${{ matrix.out }}/*.dmg
           if-no-files-found: error
 
   publish:
     name: Publish GitHub release
     needs: package
+    # Publie ce qui a été construit même si une plateforme a échoué.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -84,7 +119,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: List installers
+        run: ls -la dist
+
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true

@@ -1,6 +1,6 @@
 [package]
 name = "factorio-mod-manager"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 build = "build.rs"
 description = "Gestionnaire de mods et de modpacks pour Factorio"
@@ -39,7 +39,6 @@ product-name = "Factorio Mod Manager"
 identifier = "io.github.yetanotherrandomproject.factoriomodmanager"
 publisher = "YetAnotherRandomProject"
 category = "Game"
-before-packaging-command = "cargo build --release --locked"
 icons = ["ui/icon.png", "ui/icon.ico"]
 binaries = [{ path = "FactorioModManager", main = true }]
 

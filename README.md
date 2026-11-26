@@ -34,7 +34,7 @@ cargo test -- --ignored download_real_mod   # test réseau (identifiants Factori
 
 Sous Linux : `libfontconfig1-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev`.
 
-Installateur local : `cargo install cargo-packager --locked` puis `cargo packager --release`.
+Installateur local : `cargo install cargo-packager --locked`, puis `cargo build --release` et `cargo packager --release`.
 
 ## Publier une version
 
