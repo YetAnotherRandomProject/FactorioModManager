@@ -452,17 +452,24 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
     }
     ui.set_pack_factorio_warning(warning.into());
 
+    let filter = ui.get_pack_mod_filter().trim().to_lowercase();
     let rows: Vec<PackModRow> = pack
         .mods
         .iter()
-        .map(|e| {
-            let versions = pack_mod_versions(&k.index, e);
-            let idx = versions.iter().position(|v| v == &e.version).unwrap_or(0);
+        .enumerate()
+        .filter_map(|(pos, e)| {
             let ver: Version = e.version.parse().unwrap_or_default();
             let info = store::find(&k.index, &e.name, &ver);
             let title = display_title(info.map(|i| i.title.as_str()).unwrap_or(""), &e.name);
+            if !filter.is_empty() && !e.name.to_lowercase().contains(&filter) && !title.to_lowercase().contains(&filter) {
+                return None;
+            }
+            let versions = pack_mod_versions(&k.index, e);
+            let idx = versions.iter().position(|v| v == &e.version).unwrap_or(0);
             let icon = load_image(k.icons.get(&e.name));
-            PackModRow {
+            Some(PackModRow {
+                // Position dans le modpack (la liste affichée peut être filtrée).
+                index: pos as i32,
                 name: e.name.clone().into(),
                 letter: letter(&title),
                 title: title.into(),
@@ -472,9 +479,10 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
                 version_index: idx as i32,
                 enabled: e.enabled,
                 missing: info.is_none(),
-            }
+            })
         })
         .collect();
+    ui.set_pack_mods_total(pack.mods.len() as i32);
     ui.set_pack_mods(model(rows));
 
     let builtins: Vec<BuiltinRow> = k
@@ -1733,6 +1741,7 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
         k.selected_pack = Some(id.to_string());
         ui.set_pack_add_query("".into());
         ui.set_pack_add_results(model(vec![]));
+        ui.set_pack_mod_filter("".into());
         refresh_pack_detail(&ui, &k, true);
     });
     let (c, w) = (core.clone(), ui.as_weak());
@@ -1957,6 +1966,11 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
         let ui = w.unwrap();
         let Some(src) = rfd::FileDialog::new().add_filter("Modpack", &["fmpack"]).pick_file() else { return };
         task(&ui, &c, "Import du modpack…", move |c, w| import_pack(c, w, &src));
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_pack_mod_filter_changed(move || {
+        let ui = w.unwrap();
+        refresh_pack_detail(&ui, &c.lock().unwrap(), false);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_pack_add_search(move || {
