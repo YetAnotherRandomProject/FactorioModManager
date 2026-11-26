@@ -1,0 +1,51 @@
+[package]
+name = "factorio-mod-manager"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+description = "Gestionnaire de mods et de modpacks pour Factorio"
+authors = ["YetAnotherRandomProject"]
+repository = "https://github.com/YetAnotherRandomProject/FactorioModManager"
+homepage = "https://github.com/YetAnotherRandomProject/FactorioModManager"
+
+[[bin]]
+name = "FactorioModManager"
+path = "src/main.rs"
+
+[dependencies]
+slint = "1.19"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "6"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha1 = "0.10"
+anyhow = "1"
+rfd = "0.15"
+open = "5"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[build-dependencies]
+slint-build = "1.19"
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Installateurs : `cargo packager --release` (NSIS sous Windows, AppImage sous Linux, dmg sous macOS).
+[package.metadata.packager]
+product-name = "Factorio Mod Manager"
+identifier = "io.github.yetanotherrandomproject.factoriomodmanager"
+publisher = "YetAnotherRandomProject"
+category = "Game"
+before-packaging-command = "cargo build --release --locked"
+icons = ["ui/icon.png", "ui/icon.ico"]
+binaries = [{ path = "FactorioModManager", main = true }]
+
+[package.metadata.packager.nsis]
+# Installation par utilisateur (pas de droits administrateur) : l'auto-update peut
+# relancer l'installateur en silencieux.
+installer-mode = "currentUser"
+installer-icon = "ui/icon.ico"
+languages = ["French", "English"]

@@ -1,0 +1,1686 @@
+import { Button, LineEdit, CheckBox, ComboBox, ListView, ScrollView, Palette, Switch, ProgressIndicator, GroupBox, Spinner } from "std-widgets.slint";
+
+export struct ModRow {
+    name: string,
+    title: string,
+    letter: string,
+    summary: string,
+    icon: image,
+    has-icon: bool,
+    version: string,
+    versions-count: int,
+    update: string,
+    packs: string,
+    active: bool,
+}
+
+export struct VersionRow {
+    version: string,
+    factorio: string,
+    packs: string,
+    used: bool,
+}
+
+export struct SearchRow {
+    name: string,
+    title: string,
+    letter: string,
+    owner: string,
+    summary: string,
+    category: string,
+    is-modpack: bool,
+    downloads: string,
+    factorio: string,
+    version: string,
+    icon: image,
+    has-icon: bool,
+    installed: string,
+}
+
+export struct DepRow {
+    name: string,
+    kind: string,
+    group: int,
+    constraint: string,
+    status: string,
+    checked: bool,
+    checkable: bool,
+}
+
+export struct PackRow {
+    id: string,
+    name: string,
+    description: string,
+    active: bool,
+    mods-count: int,
+    base-mod: string,
+    factorio: string,
+    has-settings: bool,
+    saves-count: int,
+}
+
+export struct PackModRow {
+    name: string,
+    title: string,
+    letter: string,
+    icon: image,
+    has-icon: bool,
+    versions: [string],
+    version-index: int,
+    enabled: bool,
+    missing: bool,
+}
+
+export struct BuiltinRow {
+    name: string,
+    enabled: bool,
+}
+
+export struct SaveRow {
+    name: string,
+    path: string,
+}
+
+export struct AddRow {
+    name: string,
+    title: string,
+    info: string,
+    installed: bool,
+}
+
+export struct ConflictRow {
+    name: string,
+    labels: [string],
+    selected: int,
+}
+
+global Theme {
+    out property <brush> muted: Palette.foreground.transparentize(0.4);
+    out property <brush> card: Palette.alternate-background;
+    out property <brush> warn: #e0a030;
+    out property <brush> ok: #3fb950;
+}
+
+component ModIcon inherits Rectangle {
+    in property <image> icon;
+    in property <bool> has-icon;
+    in property <string> letter;
+    in property <length> size: 48px;
+    width: root.size;
+    height: root.size;
+    border-radius: 6px;
+    background: Palette.control-background;
+    clip: true;
+    if root.has-icon: Image {
+        source: root.icon;
+        width: root.size;
+        height: root.size;
+        image-fit: contain;
+    }
+    if !root.has-icon: Text {
+        text: root.letter;
+        font-size: root.size * 0.45;
+        font-weight: 700;
+        color: Theme.muted;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component Badge inherits Rectangle {
+    in property <string> text;
+    in property <brush> bg: Palette.accent-background;
+    in property <brush> fg: Palette.accent-foreground;
+    in property <length> badge-width: 96px;
+    width: root.badge-width;
+    height: 20px;
+    border-radius: 4px;
+    background: root.bg;
+    Text {
+        width: parent.width - 8px;
+        text: root.text;
+        color: root.fg;
+        font-size: 11px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+// Bouton d'action à largeur minimale commune, pour des rangées homogènes.
+component ActionButton inherits Button {
+    min-width: 130px;
+}
+
+component NavButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked;
+    height: 40px;
+    border-radius: 6px;
+    background: root.selected ? Palette.accent-background : ta.has-hover ? Palette.control-background : transparent;
+    Text {
+        x: 14px;
+        text: root.text;
+        font-size: 14px;
+        font-weight: root.selected ? 700 : 400;
+        color: root.selected ? Palette.accent-foreground : Palette.foreground;
+        vertical-alignment: center;
+        height: parent.height;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component SectionTitle inherits Text {
+    font-size: 15px;
+    font-weight: 700;
+}
+
+component ModCard inherits Rectangle {
+    in property <ModRow> data;
+    in property <bool> selected;
+    callback clicked;
+    height: 72px;
+    border-radius: 6px;
+    background: root.selected ? Palette.selection-background : ta.has-hover ? Theme.card : transparent;
+    HorizontalLayout {
+        padding: 8px;
+        spacing: 10px;
+        ModIcon {
+            icon: root.data.icon;
+            has-icon: root.data.has-icon;
+            letter: root.data.letter;
+        }
+        VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            Text {
+                text: root.data.title;
+                font-weight: 700;
+                overflow: elide;
+                color: root.selected ? Palette.selection-foreground : Palette.foreground;
+            }
+            Text {
+                text: root.data.summary;
+                color: root.selected ? Palette.selection-foreground : Theme.muted;
+                overflow: elide;
+                font-size: 12px;
+            }
+            Text {
+                text: root.data.packs != "" ? "Modpacks : " + root.data.packs : "Aucun modpack";
+                color: root.selected ? Palette.selection-foreground : Theme.muted;
+                overflow: elide;
+                font-size: 11px;
+            }
+        }
+        VerticalLayout {
+            width: 96px;
+            spacing: 3px;
+            alignment: center;
+            Text {
+                text: root.data.version;
+                color: root.selected ? Palette.selection-foreground : Theme.muted;
+                font-size: 12px;
+                horizontal-alignment: right;
+                overflow: elide;
+            }
+            if root.data.active: Badge {
+                text: "actif";
+                bg: Theme.ok;
+                fg: white;
+            }
+            if root.data.update != "": Badge {
+                text: "MàJ " + root.data.update;
+                bg: Theme.warn;
+                fg: black;
+            }
+        }
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component Overlay inherits Rectangle {
+    in property <length> dialog-width: 640px;
+    in property <length> dialog-height: 520px;
+    background: #000000a0;
+    TouchArea { }
+    Rectangle {
+        width: min(root.dialog-width, root.width - 40px);
+        height: min(root.dialog-height, root.height - 40px);
+        background: Palette.background;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Palette.border;
+        drop-shadow-blur: 20px;
+        drop-shadow-color: #00000080;
+        VerticalLayout {
+            padding: 18px;
+            spacing: 10px;
+            @children
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Factorio Mod Manager";
+    preferred-width: 1320px;
+    preferred-height: 840px;
+    min-width: 960px;
+    min-height: 600px;
+    icon: @image-url("icon.png");
+
+    in-out property <int> page: 0;
+
+    // ---------- Barre d'état ----------
+    in property <string> status: "Prêt";
+    in property <bool> busy: false;
+    in property <float> progress: -1;
+    in property <string> active-summary: "";
+    callback sync-now();
+    callback launch-game();
+
+    // ---------- Bibliothèque ----------
+    in property <[ModRow]> library: [];
+    in property <int> library-total: 0;
+    in-out property <string> library-filter: "";
+    in-out property <int> library-mode: 0;
+    in property <string> selected-mod: "";
+    in property <bool> detail-visible: false;
+    in property <string> detail-title;
+    in property <string> detail-name;
+    in property <string> detail-author;
+    in property <string> detail-summary;
+    in property <string> detail-description;
+    in property <string> detail-homepage;
+    in property <string> detail-update;
+    in property <string> detail-factorio;
+    in property <image> detail-icon;
+    in property <bool> detail-has-icon;
+    in property <string> detail-letter;
+    in property <[VersionRow]> detail-versions: [];
+    in property <[string]> detail-version-names: [];
+    in property <[string]> detail-deps: [];
+    in property <[string]> pack-names: [];
+    in-out property <int> add-pack-index: 0;
+    in-out property <int> add-version-index: 0;
+    callback library-filter-changed();
+    callback select-mod(string);
+    callback import-existing();
+    callback check-updates();
+    callback refresh-library();
+    callback open-portal(string);
+    callback open-url(string);
+    callback download-update(string);
+    callback delete-version(string, string);
+    callback use-version-everywhere(string, string);
+    callback add-to-pack(string, int, int);
+
+    // ---------- Recherche ----------
+    in-out property <string> search-query: "";
+    in property <[string]> search-categories: [];
+    in-out property <int> search-category: 0;
+    in property <[string]> search-versions: [];
+    in-out property <int> search-version: 0;
+    in property <[SearchRow]> search-results: [];
+    in property <string> search-info: "";
+    callback do-search();
+    callback refresh-index();
+    callback open-download(string);
+
+    // ---------- Fenêtre de téléchargement ----------
+    in property <bool> dl-visible: false;
+    in property <bool> dl-loading: false;
+    in property <string> dl-title;
+    in property <string> dl-name;
+    in property <string> dl-info;
+    in property <[string]> dl-versions: [];
+    in-out property <int> dl-version-index: 0;
+    in property <[DepRow]> dl-deps: [];
+    in-out property <bool> dl-rec-all: false;
+    in-out property <bool> dl-opt-all: false;
+    in-out property <bool> dl-hidden-all: false;
+    in property <[string]> dl-targets: [];
+    in-out property <int> dl-target-index: 0;
+    in property <bool> dl-is-modpack: false;
+    in-out property <bool> dl-make-pack: false;
+    in-out property <string> dl-pack-name: "";
+    callback dl-version-changed(int);
+    callback dl-toggle-dep(int, bool);
+    callback dl-toggle-group(int, bool);
+    callback dl-confirm();
+    callback dl-cancel();
+
+    // ---------- Modpacks ----------
+    in property <[PackRow]> packs: [];
+    in property <string> selected-pack: "";
+    in property <bool> pack-visible: false;
+    in-out property <string> pack-name: "";
+    in-out property <string> pack-description: "";
+    in-out property <string> pack-factorio: "";
+    in property <string> pack-base-mod: "";
+    in property <string> pack-factorio-warning: "";
+    in property <[PackModRow]> pack-mods: [];
+    in property <[BuiltinRow]> pack-builtins: [];
+    in property <[SaveRow]> pack-saves: [];
+    in property <string> pack-settings-info: "";
+    in property <bool> pack-has-settings: false;
+    in property <[string]> pack-warnings: [];
+    callback new-pack();
+    callback import-pack();
+    callback select-pack(string);
+    callback toggle-pack(string, bool);
+    callback save-pack-meta();
+    callback delete-pack();
+    callback duplicate-pack();
+    callback export-pack();
+    callback pack-mod-version(int, int);
+    callback pack-mod-enabled(int, bool);
+    callback pack-mod-remove(int);
+    callback pack-builtin(int, bool);
+    callback capture-settings();
+    callback clear-settings();
+    callback add-save();
+    callback remove-save(int);
+    callback launch-save(int);
+    callback browse-modpacks();
+    in-out property <string> pack-add-query: "";
+    in property <[AddRow]> pack-add-results: [];
+    callback pack-add-search();
+    callback pack-add(string, bool);
+
+    // ---------- Conflits ----------
+    in property <bool> conflict-visible: false;
+    in property <[ConflictRow]> conflicts: [];
+    in-out property <bool> conflict-remember: true;
+    callback conflict-select(int, int);
+    callback conflict-confirm();
+    callback conflict-cancel();
+
+    // ---------- Confirmation ----------
+    in property <bool> confirm-visible: false;
+    in property <string> confirm-title;
+    in property <string> confirm-text;
+    in property <string> confirm-ok: "Confirmer";
+    callback confirm-accept();
+    callback confirm-cancel();
+
+    // ---------- Paramètres ----------
+    in-out property <string> s-user-dir;
+    in-out property <string> s-exe;
+    in property <string> s-detected;
+    in property <string> s-credentials;
+    in-out property <string> s-username;
+    in-out property <string> s-token;
+    in-out property <string> s-target;
+    in-out property <bool> s-feat-settings;
+    in-out property <bool> s-feat-version;
+    in-out property <bool> s-feat-export;
+    in-out property <bool> s-feat-saves;
+    in-out property <bool> s-auto-updates;
+    in-out property <bool> s-auto-sync;
+    in-out property <bool> s-export-mods;
+    in-out property <bool> s-copy-back;
+    in-out property <string> s-interval;
+    in-out property <bool> s-auto-app;
+    in property <string> app-version;
+    in property <string> app-update: "";
+    callback install-app-update();
+    in property <string> s-data-dir;
+    callback save-settings();
+    callback detect-factorio();
+    callback browse-user-dir();
+    callback browse-exe();
+    callback open-data-dir();
+
+    HorizontalLayout {
+        // ---------- Barre latérale ----------
+        Rectangle {
+            width: 210px;
+            background: Theme.card;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 4px;
+                Text {
+                    text: "Factorio\nMod Manager";
+                    font-size: 18px;
+                    font-weight: 800;
+                    height: 64px;
+                    vertical-alignment: center;
+                }
+                NavButton {
+                    text: "Bibliothèque";
+                    selected: root.page == 0;
+                    clicked => {
+                        root.page = 0;
+                    }
+                }
+                NavButton {
+                    text: "Rechercher";
+                    selected: root.page == 1;
+                    clicked => {
+                        root.page = 1;
+                    }
+                }
+                NavButton {
+                    text: "Modpacks";
+                    selected: root.page == 2;
+                    clicked => {
+                        root.page = 2;
+                    }
+                }
+                NavButton {
+                    text: "Paramètres";
+                    selected: root.page == 3;
+                    clicked => {
+                        root.page = 3;
+                    }
+                }
+                Rectangle { }
+                if root.app-update != "": Button {
+                    text: "Mettre à jour l'app (" + root.app-update + ")";
+                    primary: true;
+                    clicked => {
+                        root.install-app-update();
+                    }
+                }
+                Text {
+                    text: root.active-summary;
+                    wrap: word-wrap;
+                    color: Theme.muted;
+                    font-size: 12px;
+                }
+                Button {
+                    text: "Synchroniser vers Factorio";
+                    clicked => {
+                        root.sync-now();
+                    }
+                }
+                Button {
+                    text: "▶  Lancer Factorio";
+                    primary: true;
+                    clicked => {
+                        root.launch-game();
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            // ---------- Pages ----------
+            Rectangle {
+                vertical-stretch: 1;
+                // ===== Bibliothèque =====
+                if root.page == 0: HorizontalLayout {
+                    padding: 14px;
+                    spacing: 14px;
+                    VerticalLayout {
+                        spacing: 8px;
+                        width: root.detail-visible ? 44% * parent.width : parent.width - 28px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            LineEdit {
+                                placeholder-text: "Filtrer les mods installés…";
+                                text <=> root.library-filter;
+                                edited => {
+                                    root.library-filter-changed();
+                                }
+                            }
+                            ComboBox {
+                                width: 150px;
+                                model: ["Tous", "Actifs", "Non utilisés", "Mises à jour"];
+                                current-index <=> root.library-mode;
+                                selected => {
+                                    root.library-filter-changed();
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                horizontal-stretch: 1;
+                                preferred-width: 10px;
+                                text: "Importer de Factorio";
+                                clicked => {
+                                    root.import-existing();
+                                }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                preferred-width: 10px;
+                                text: "Mises à jour";
+                                clicked => {
+                                    root.check-updates();
+                                }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                preferred-width: 10px;
+                                text: "Actualiser";
+                                clicked => {
+                                    root.refresh-library();
+                                }
+                            }
+                        }
+                        Text {
+                            text: root.library.length + " / " + root.library-total + " mod(s)";
+                            color: Theme.muted;
+                            font-size: 12px;
+                        }
+                        ListView {
+                            for row in root.library: ModCard {
+                                data: row;
+                                selected: row.name == root.selected-mod;
+                                clicked => {
+                                    root.select-mod(row.name);
+                                }
+                            }
+                        }
+                    }
+                    if root.detail-visible: Rectangle {
+                        background: Theme.card;
+                        border-radius: 8px;
+                        sv := ScrollView {
+                            VerticalLayout {
+                                width: sv.visible-width;
+                                alignment: start;
+                                padding: 16px;
+                                spacing: 10px;
+                                HorizontalLayout {
+                                    spacing: 14px;
+                                    ModIcon {
+                                        size: 96px;
+                                        icon: root.detail-icon;
+                                        has-icon: root.detail-has-icon;
+                                        letter: root.detail-letter;
+                                    }
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        Text {
+                                            text: root.detail-title;
+                                            font-size: 20px;
+                                            font-weight: 700;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: root.detail-name + "  •  par " + root.detail-author;
+                                            color: Theme.muted;
+                                            wrap: word-wrap;
+                                        }
+                                        Text {
+                                            text: "Factorio " + root.detail-factorio;
+                                            color: Theme.muted;
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: root.detail-summary;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    ActionButton {
+                                        text: "Page du portail";
+                                        clicked => {
+                                            root.open-portal(root.detail-name);
+                                        }
+                                    }
+                                    if root.detail-homepage != "": ActionButton {
+                                        text: "Site du mod";
+                                        clicked => {
+                                            root.open-url(root.detail-homepage);
+                                        }
+                                    }
+                                    if root.detail-update != "": ActionButton {
+                                        text: "Télécharger la " + root.detail-update;
+                                        primary: true;
+                                        clicked => {
+                                            root.download-update(root.detail-name);
+                                        }
+                                    }
+                                }
+                                SectionTitle {
+                                    text: "Versions dans le dépôt";
+                                }
+                                for v in root.detail-versions: Rectangle {
+                                    border-radius: 6px;
+                                    background: Palette.control-background;
+                                    HorizontalLayout {
+                                        padding: 6px;
+                                        spacing: 8px;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Text {
+                                                text: v.version + "   (Factorio " + v.factorio + ")";
+                                                font-weight: 700;
+                                            }
+                                            Text {
+                                                text: v.used ? "Utilisée par : " + v.packs : "Utilisée par aucun modpack";
+                                                color: Theme.muted;
+                                                font-size: 12px;
+                                                wrap: word-wrap;
+                                            }
+                                        }
+                                        ActionButton {
+                                            text: "Utiliser partout";
+                                            clicked => {
+                                                root.use-version-everywhere(root.detail-name, v.version);
+                                            }
+                                        }
+                                        ActionButton {
+                                            text: "Supprimer";
+                                            enabled: !v.used;
+                                            clicked => {
+                                                root.delete-version(root.detail-name, v.version);
+                                            }
+                                        }
+                                    }
+                                }
+                                SectionTitle {
+                                    text: "Ajouter à un modpack";
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    ComboBox {
+                                        model: root.pack-names;
+                                        current-index <=> root.add-pack-index;
+                                    }
+                                    ComboBox {
+                                        width: 120px;
+                                        model: root.detail-version-names;
+                                        current-index <=> root.add-version-index;
+                                    }
+                                    ActionButton {
+                                        text: "Ajouter";
+                                        enabled: root.pack-names.length > 0;
+                                        clicked => {
+                                            root.add-to-pack(root.detail-name, root.add-pack-index, root.add-version-index);
+                                        }
+                                    }
+                                }
+                                SectionTitle {
+                                    text: "Dépendances";
+                                }
+                                for d in root.detail-deps: Text {
+                                    text: d;
+                                    color: Theme.muted;
+                                    wrap: word-wrap;
+                                }
+                                SectionTitle {
+                                    text: "Description";
+                                }
+                                Text {
+                                    text: root.detail-description;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ===== Recherche =====
+                if root.page == 1: VerticalLayout {
+                    padding: 14px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        LineEdit {
+                            placeholder-text: "Rechercher sur le portail (nom, titre, auteur, description)…";
+                            text <=> root.search-query;
+                            accepted => {
+                                root.do-search();
+                            }
+                        }
+                        ComboBox {
+                            width: 160px;
+                            model: root.search-categories;
+                            current-index <=> root.search-category;
+                            selected => {
+                                root.do-search();
+                            }
+                        }
+                        ComboBox {
+                            width: 130px;
+                            model: root.search-versions;
+                            current-index <=> root.search-version;
+                            selected => {
+                                root.do-search();
+                            }
+                        }
+                        ActionButton {
+                            text: "Rechercher";
+                            primary: true;
+                            clicked => {
+                                root.do-search();
+                            }
+                        }
+                        ActionButton {
+                            text: "Rafraîchir l'index";
+                            clicked => {
+                                root.refresh-index();
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.search-info;
+                        color: Theme.muted;
+                        font-size: 12px;
+                    }
+                    ListView {
+                        for r in root.search-results: Rectangle {
+                            height: 84px;
+                            HorizontalLayout {
+                                padding: 8px;
+                                spacing: 10px;
+                                ModIcon {
+                                    size: 64px;
+                                    icon: r.icon;
+                                    has-icon: r.has-icon;
+                                    letter: r.letter;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text {
+                                        text: r.title;
+                                        font-weight: 700;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: r.summary;
+                                        color: Theme.muted;
+                                        overflow: elide;
+                                        font-size: 12px;
+                                    }
+                                    Text {
+                                        text: "par " + r.owner + "  •  " + r.version + "  •  Factorio " + r.factorio + "  •  " + r.downloads + " téléchargements";
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                    }
+                                }
+                                VerticalLayout {
+                                    width: 110px;
+                                    alignment: center;
+                                    spacing: 4px;
+                                    Badge {
+                                        badge-width: 110px;
+                                        text: r.category;
+                                        bg: r.is-modpack ? Theme.warn : Palette.control-background;
+                                        fg: r.is-modpack ? black : Palette.foreground;
+                                    }
+                                    if r.installed != "": Badge {
+                                        badge-width: 110px;
+                                        text: "installé " + r.installed;
+                                        bg: Theme.ok;
+                                        fg: white;
+                                    }
+                                }
+                                VerticalLayout {
+                                    width: 130px;
+                                    alignment: center;
+                                    spacing: 4px;
+                                    Button {
+                                        text: "Télécharger…";
+                                        primary: true;
+                                        clicked => {
+                                            root.open-download(r.name);
+                                        }
+                                    }
+                                    Button {
+                                        text: "Portail";
+                                        clicked => {
+                                            root.open-portal(r.name);
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: Palette.border;
+                            }
+                        }
+                    }
+                }
+
+                // ===== Modpacks =====
+                if root.page == 2: HorizontalLayout {
+                    padding: 14px;
+                    spacing: 14px;
+                    VerticalLayout {
+                        width: 320px;
+                        spacing: 8px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                horizontal-stretch: 1;
+                                preferred-width: 10px;
+                                text: "+ Nouveau";
+                                primary: true;
+                                clicked => {
+                                    root.new-pack();
+                                }
+                            }
+                            Button {
+                                horizontal-stretch: 1;
+                                preferred-width: 10px;
+                                text: "Depuis un modpack…";
+                                clicked => {
+                                    root.browse-modpacks();
+                                }
+                            }
+                        }
+                        if root.s-feat-export: Button {
+                            text: "Importer un fichier .fmpack…";
+                            clicked => {
+                                root.import-pack();
+                            }
+                        }
+                        ListView {
+                            for p in root.packs: Rectangle {
+                                height: 70px;
+                                border-radius: 6px;
+                                background: p.id == root.selected-pack ? Palette.selection-background : pta.has-hover ? Theme.card : transparent;
+                                pta := TouchArea {
+                                    clicked => {
+                                        root.select-pack(p.id);
+                                    }
+                                }
+                                HorizontalLayout {
+                                    padding: 8px;
+                                    spacing: 8px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text {
+                                            text: p.name;
+                                            font-weight: 700;
+                                            overflow: elide;
+                                            color: p.id == root.selected-pack ? Palette.selection-foreground : Palette.foreground;
+                                        }
+                                        Text {
+                                            text: p.mods-count + " mod(s)" + (p.factorio != "" && root.s-feat-version ? "  •  Factorio " + p.factorio : "") + (p.base-mod != "" ? "  •  basé sur " + p.base-mod : "");
+                                            color: Theme.muted;
+                                            font-size: 12px;
+                                            overflow: elide;
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 4px;
+                                            alignment: start;
+                                            if p.has-settings && root.s-feat-settings: Badge {
+                                                text: "réglages";
+                                            }
+                                            if p.saves-count > 0 && root.s-feat-saves: Badge {
+                                                text: p.saves-count + " sauvegarde(s)";
+                                            }
+                                        }
+                                    }
+                                    Switch {
+                                        horizontal-stretch: 0;
+                                        checked: p.active;
+                                        toggled => {
+                                            root.toggle-pack(p.id, self.checked);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !root.pack-visible: Rectangle {
+                        Text {
+                            text: root.packs.length == 0 ? "Aucun modpack. Crée-en un, ou importe tes mods actuels depuis la Bibliothèque." : "Sélectionne un modpack.";
+                            color: Theme.muted;
+                        }
+                    }
+                    if root.pack-visible: Rectangle {
+                        background: Theme.card;
+                        border-radius: 8px;
+                        VerticalLayout {
+                                padding: 16px;
+                                spacing: 10px;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        text <=> root.pack-name;
+                                        placeholder-text: "Nom du modpack";
+                                        font-size: 16px;
+                                    }
+                                    if root.s-feat-version: LineEdit {
+                                        width: 130px;
+                                        text <=> root.pack-factorio;
+                                        placeholder-text: "Factorio (ex. 2.0)";
+                                    }
+                                }
+                                LineEdit {
+                                    text <=> root.pack-description;
+                                    placeholder-text: "Description";
+                                }
+                                if root.pack-base-mod != "": Text {
+                                    text: "Basé sur le modpack du portail : " + root.pack-base-mod;
+                                    color: Theme.muted;
+                                }
+                                if root.pack-factorio-warning != "" && root.s-feat-version: Text {
+                                    text: root.pack-factorio-warning;
+                                    color: Theme.warn;
+                                    wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    ActionButton {
+                                        text: "Enregistrer";
+                                        primary: true;
+                                        clicked => {
+                                            root.save-pack-meta();
+                                        }
+                                    }
+                                    ActionButton {
+                                        text: "Dupliquer";
+                                        clicked => {
+                                            root.duplicate-pack();
+                                        }
+                                    }
+                                    if root.s-feat-export: ActionButton {
+                                        text: "Exporter…";
+                                        clicked => {
+                                            root.export-pack();
+                                        }
+                                    }
+                                    ActionButton {
+                                        text: "Supprimer";
+                                        clicked => {
+                                            root.delete-pack();
+                                        }
+                                    }
+                                }
+                                if root.pack-warnings.length > 0: VerticalLayout {
+                                    spacing: 4px;
+                                    SectionTitle {
+                                        text: "Problèmes détectés (" + root.pack-warnings.length + ")";
+                                        color: Theme.warn;
+                                    }
+                                    ListView {
+                                        height: min(96px, root.pack-warnings.length * 18px);
+                                        for w in root.pack-warnings: Text {
+                                            height: 18px;
+                                            text: "• " + w;
+                                            color: Theme.warn;
+                                            overflow: elide;
+                                            font-size: 12px;
+                                        }
+                                    }
+                                }
+                                SectionTitle {
+                                    text: "Jeu de base et DLC";
+                                }
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    alignment: start;
+                                    for b[i] in root.pack-builtins: CheckBox {
+                                        text: b.name;
+                                        checked: b.enabled;
+                                        enabled: b.name != "base";
+                                        toggled => {
+                                            root.pack-builtin(i, self.checked);
+                                        }
+                                    }
+                                }
+                                if root.s-feat-settings: HorizontalLayout {
+                                    spacing: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        SectionTitle {
+                                            text: "Réglages des mods (mod-settings.dat)";
+                                        }
+                                        Text {
+                                            text: root.pack-settings-info;
+                                            color: Theme.muted;
+                                            overflow: elide;
+                                        }
+                                    }
+                                    if root.pack-has-settings: ActionButton {
+                                        y: 6px;
+                                        height: 32px;
+                                        text: "Effacer";
+                                        clicked => {
+                                            root.clear-settings();
+                                        }
+                                    }
+                                    ActionButton {
+                                        y: 6px;
+                                        height: 32px;
+                                        width: 200px;
+                                        text: "Capturer les réglages actuels";
+                                        clicked => {
+                                            root.capture-settings();
+                                        }
+                                    }
+                                }
+                                if root.s-feat-saves: VerticalLayout {
+                                    spacing: 6px;
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        SectionTitle {
+                                            text: "Sauvegardes liées (" + root.pack-saves.length + ")";
+                                            vertical-alignment: center;
+                                        }
+                                        ActionButton {
+                                            width: 200px;
+                                            text: "Lier une sauvegarde…";
+                                            clicked => {
+                                                root.add-save();
+                                            }
+                                        }
+                                    }
+                                    for s[i] in root.pack-saves: HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: s.name;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        ActionButton {
+                                            text: "▶ Lancer";
+                                            clicked => {
+                                                root.launch-save(i);
+                                            }
+                                        }
+                                        ActionButton {
+                                            text: "Retirer";
+                                            clicked => {
+                                                root.remove-save(i);
+                                            }
+                                        }
+                                    }
+                                }
+                                SectionTitle {
+                                    text: "Mods (" + root.pack-mods.length + ")";
+                                }
+                                LineEdit {
+                                    placeholder-text: "Ajouter un mod : rechercher dans le dépôt et sur le portail…";
+                                    text <=> root.pack-add-query;
+                                    edited => {
+                                        root.pack-add-search();
+                                    }
+                                }
+                                if root.pack-add-results.length > 0: Rectangle {
+                                    height: min(4, root.pack-add-results.length) * 46px + 2px;
+                                    border-width: 1px;
+                                    border-color: Palette.border;
+                                    border-radius: 6px;
+                                    ListView {
+                                        for a in root.pack-add-results: Rectangle {
+                                            height: 46px;
+                                            HorizontalLayout {
+                                                padding-left: 10px;
+                                                padding-right: 6px;
+                                                spacing: 8px;
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Text {
+                                                        text: a.title;
+                                                        font-weight: 600;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: a.name + "  •  " + a.info;
+                                                        color: Theme.muted;
+                                                        font-size: 11px;
+                                                        overflow: elide;
+                                                    }
+                                                }
+                                                ActionButton {
+                                                    width: 130px;
+                                                    height: 32px;
+                                                    y: 7px;
+                                                    text: a.installed ? "Ajouter" : "Télécharger…";
+                                                    primary: a.installed;
+                                                    clicked => {
+                                                        root.pack-add(a.name, a.installed);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.pack-mods.length == 0: Text {
+                                    text: "Ajoute des mods depuis la Bibliothèque (fiche d'un mod) ou la Recherche.";
+                                    color: Theme.muted;
+                                    wrap: word-wrap;
+                                }
+                                ListView {
+                                    vertical-stretch: 1;
+                                    for m[i] in root.pack-mods: Rectangle {
+                                    height: 52px;
+                                    border-radius: 6px;
+                                    background: Math.mod(i, 2) == 0 ? Palette.control-background : transparent;
+                                    HorizontalLayout {
+                                        padding: 6px;
+                                        spacing: 8px;
+                                        ModIcon {
+                                            size: 36px;
+                                            icon: m.icon;
+                                            has-icon: m.has-icon;
+                                            letter: m.letter;
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            horizontal-stretch: 1;
+                                            Text {
+                                                text: m.title;
+                                                font-weight: 600;
+                                                overflow: elide;
+                                            }
+                                            Text {
+                                                text: m.missing ? m.name + " — absent du dépôt" : m.name;
+                                                color: m.missing ? Theme.warn : Theme.muted;
+                                                font-size: 11px;
+                                                overflow: elide;
+                                            }
+                                        }
+                                        ComboBox {
+                                            width: 120px;
+                                            model: m.versions;
+                                            current-index: m.version-index;
+                                            selected => {
+                                                root.pack-mod-version(i, self.current-index);
+                                            }
+                                        }
+                                        CheckBox {
+                                            width: 72px;
+                                            text: "actif";
+                                            checked: m.enabled;
+                                            toggled => {
+                                                root.pack-mod-enabled(i, self.checked);
+                                            }
+                                        }
+                                        Button {
+                                            width: 90px;
+                                            text: "Retirer";
+                                            clicked => {
+                                                root.pack-mod-remove(i);
+                                            }
+                                        }
+                                    }
+                                }
+                                }
+                            }
+                        }
+                    }
+
+                // ===== Paramètres =====
+                if root.page == 3: ScrollView {
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 12px;
+                        alignment: start;
+                        GroupBox {
+                            title: "Factorio";
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "Dossier utilisateur (contient mods/, saves/, player-data.json)";
+                                    color: Theme.muted;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        text <=> root.s-user-dir;
+                                    }
+                                    ActionButton {
+                                        text: "Parcourir…";
+                                        clicked => {
+                                            root.browse-user-dir();
+                                        }
+                                    }
+                                }
+                                Text {
+                                    text: "Exécutable du jeu";
+                                    color: Theme.muted;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        text <=> root.s-exe;
+                                    }
+                                    ActionButton {
+                                        text: "Parcourir…";
+                                        clicked => {
+                                            root.browse-exe();
+                                        }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    ActionButton {
+                                        text: "Détecter automatiquement";
+                                        clicked => {
+                                            root.detect-factorio();
+                                        }
+                                    }
+                                    Text {
+                                        text: root.s-detected;
+                                        color: Theme.muted;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                Text {
+                                    text: "Version de Factorio ciblée pour les téléchargements (vide = version installée)";
+                                    color: Theme.muted;
+                                }
+                                LineEdit {
+                                    text <=> root.s-target;
+                                    placeholder-text: "ex. 2.0";
+                                }
+                            }
+                        }
+                        GroupBox {
+                            title: "Portail des mods";
+                            VerticalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: root.s-credentials;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: "Identifiants manuels (laisser vide pour utiliser player-data.json)";
+                                    color: Theme.muted;
+                                }
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    LineEdit {
+                                        text <=> root.s-username;
+                                        placeholder-text: "Nom d'utilisateur";
+                                    }
+                                    LineEdit {
+                                        text <=> root.s-token;
+                                        placeholder-text: "Token";
+                                        input-type: password;
+                                    }
+                                }
+                            }
+                        }
+                        GroupBox {
+                            title: "Contenu des modpacks";
+                            VerticalLayout {
+                                spacing: 4px;
+                                CheckBox {
+                                    text: "Réglages des mods (mod-settings.dat) par modpack";
+                                    checked <=> root.s-feat-settings;
+                                }
+                                CheckBox {
+                                    text: "Version de Factorio par modpack";
+                                    checked <=> root.s-feat-version;
+                                }
+                                CheckBox {
+                                    text: "Export / import de modpacks";
+                                    checked <=> root.s-feat-export;
+                                }
+                                CheckBox {
+                                    text: "Sauvegardes liées aux modpacks";
+                                    checked <=> root.s-feat-saves;
+                                }
+                            }
+                        }
+                        GroupBox {
+                            title: "Comportement";
+                            VerticalLayout {
+                                spacing: 4px;
+                                CheckBox {
+                                    text: "Vérifier régulièrement les mises à jour des mods";
+                                    checked <=> root.s-auto-updates;
+                                }
+                                CheckBox {
+                                    text: "Vérifier les nouvelles versions de l'application (GitHub)";
+                                    checked <=> root.s-auto-app;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Text {
+                                        text: "Intervalle de vérification (mises à jour et index du portail), en minutes :";
+                                        vertical-alignment: center;
+                                    }
+                                    LineEdit {
+                                        width: 80px;
+                                        text <=> root.s-interval;
+                                        input-type: number;
+                                    }
+                                }
+                                CheckBox {
+                                    text: "Synchroniser vers Factorio à chaque activation de modpack";
+                                    checked <=> root.s-auto-sync;
+                                }
+                                CheckBox {
+                                    text: "Inclure les fichiers des mods dans les exports";
+                                    checked <=> root.s-export-mods;
+                                }
+                                CheckBox {
+                                    text: "Après une partie lancée depuis l'app, enregistrer les réglages dans le modpack";
+                                    checked <=> root.s-copy-back;
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            ActionButton {
+                                text: "Enregistrer les paramètres";
+                                primary: true;
+                                clicked => {
+                                    root.save-settings();
+                                }
+                            }
+                            ActionButton {
+                                text: "Ouvrir le dossier de données";
+                                clicked => {
+                                    root.open-data-dir();
+                                }
+                            }
+                            Text {
+                                text: root.s-data-dir;
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------- Barre d'état ----------
+            Rectangle {
+                height: 30px;
+                background: Theme.card;
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 10px;
+                    if root.busy: Spinner {
+                        width: 18px;
+                        height: 18px;
+                        indeterminate: true;
+                        y: 6px;
+                    }
+                    Text {
+                        text: root.status;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    if root.progress >= 0: ProgressIndicator {
+                        width: 200px;
+                        height: 8px;
+                        y: 11px;
+                        progress: root.progress;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- Fenêtre de téléchargement ----------
+    if root.dl-visible: Overlay {
+        dialog-width: 760px;
+        dialog-height: 640px;
+        Text {
+            text: "Télécharger « " + root.dl-title + " »";
+            font-size: 18px;
+            font-weight: 700;
+            overflow: elide;
+        }
+        Text {
+            text: root.dl-info;
+            color: Theme.muted;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Version :";
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+            ComboBox {
+                model: root.dl-versions;
+                current-index <=> root.dl-version-index;
+                enabled: !root.dl-loading;
+                selected => {
+                    root.dl-version-changed(self.current-index);
+                }
+            }
+            if root.dl-loading: Spinner {
+                width: 22px;
+                height: 22px;
+                indeterminate: true;
+            }
+        }
+        HorizontalLayout {
+            spacing: 14px;
+            alignment: start;
+            CheckBox {
+                text: "Obligatoires (toujours inclus)";
+                checked: true;
+                enabled: false;
+            }
+            CheckBox {
+                text: "Recommandés";
+                checked <=> root.dl-rec-all;
+                toggled => {
+                    root.dl-toggle-group(1, self.checked);
+                }
+            }
+            CheckBox {
+                text: "Optionnels";
+                checked <=> root.dl-opt-all;
+                toggled => {
+                    root.dl-toggle-group(2, self.checked);
+                }
+            }
+            CheckBox {
+                text: "Optionnels cachés";
+                checked <=> root.dl-hidden-all;
+                toggled => {
+                    root.dl-toggle-group(3, self.checked);
+                }
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 6px;
+            ListView {
+                for d[i] in root.dl-deps: Rectangle {
+                    height: 40px;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 8px;
+                        CheckBox {
+                            horizontal-stretch: 0;
+                            checked: d.checked;
+                            enabled: d.checkable;
+                            toggled => {
+                                root.dl-toggle-dep(i, self.checked);
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: d.name + "  " + d.constraint;
+                                font-weight: 600;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: d.status;
+                                color: d.group == 4 ? Theme.warn : Theme.muted;
+                                font-size: 11px;
+                                overflow: elide;
+                            }
+                        }
+                        Badge {
+                            height: 18px;
+                            y: 11px;
+                            text: d.kind;
+                            bg: d.group == 0 ? Palette.accent-background : d.group == 1 ? Theme.ok : d.group == 4 ? Theme.warn : Palette.control-background;
+                            fg: d.group == 0 ? Palette.accent-foreground : d.group == 1 ? white : d.group == 4 ? black : Palette.foreground;
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Ajouter au modpack :";
+                vertical-alignment: center;
+                horizontal-stretch: 0;
+            }
+            ComboBox {
+                model: root.dl-targets;
+                current-index <=> root.dl-target-index;
+            }
+        }
+        if root.dl-is-modpack: HorizontalLayout {
+            spacing: 8px;
+            CheckBox {
+                horizontal-stretch: 0;
+                text: "Créer un modpack à partir de ce mod";
+                checked <=> root.dl-make-pack;
+            }
+            LineEdit {
+                enabled: root.dl-make-pack;
+                text <=> root.dl-pack-name;
+                placeholder-text: "Nom du nouveau modpack";
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            ActionButton {
+                text: "Annuler";
+                clicked => {
+                    root.dl-cancel();
+                }
+            }
+            ActionButton {
+                text: "Télécharger";
+                primary: true;
+                enabled: !root.dl-loading && root.dl-versions.length > 0;
+                clicked => {
+                    root.dl-confirm();
+                }
+            }
+        }
+    }
+
+    // ---------- Conflits ----------
+    if root.conflict-visible: Overlay {
+        dialog-width: 620px;
+        dialog-height: 480px;
+        Text {
+            text: "Conflits de versions";
+            font-size: 18px;
+            font-weight: 700;
+        }
+        Text {
+            text: "Plusieurs modpacks actifs demandent des versions différentes des mods ci-dessous. Choisis la version à charger.";
+            wrap: word-wrap;
+            color: Theme.muted;
+        }
+        ListView {
+            vertical-stretch: 1;
+            for c[i] in root.conflicts: HorizontalLayout {
+                padding: 4px;
+                spacing: 8px;
+                height: 44px;
+                Text {
+                    text: c.name;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    width: 180px;
+                    overflow: elide;
+                }
+                ComboBox {
+                    model: c.labels;
+                    current-index: c.selected;
+                    selected => {
+                        root.conflict-select(i, self.current-index);
+                    }
+                }
+            }
+        }
+        CheckBox {
+            text: "Se souvenir de ces choix";
+            checked <=> root.conflict-remember;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            ActionButton {
+                text: "Annuler";
+                clicked => {
+                    root.conflict-cancel();
+                }
+            }
+            ActionButton {
+                text: "Valider";
+                primary: true;
+                clicked => {
+                    root.conflict-confirm();
+                }
+            }
+        }
+    }
+
+    // ---------- Confirmation ----------
+    if root.confirm-visible: Overlay {
+        dialog-width: 600px;
+        dialog-height: 480px;
+        Text {
+            text: root.confirm-title;
+            font-size: 18px;
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            Text {
+                x: 0;
+                y: 0;
+                width: parent.width;
+                height: parent.height;
+                text: root.confirm-text;
+                wrap: word-wrap;
+                vertical-alignment: top;
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            ActionButton {
+                text: "Annuler";
+                clicked => {
+                    root.confirm-cancel();
+                }
+            }
+            ActionButton {
+                text: root.confirm-ok;
+                primary: true;
+                clicked => {
+                    root.confirm-accept();
+                }
+            }
+        }
+    }
+}
