@@ -198,8 +198,14 @@ fn strings(v: Vec<String>) -> ModelRc<SharedString> {
 
 /// Titre affichable : certains info.json contiennent des titres de gabarit (« [MOD DISPLAY NAME] »).
 fn display_title(title: &str, name: &str) -> String {
-    let t = title.trim();
-    if t.is_empty() || (t.starts_with('[') && t.ends_with(']')) { name.to_string() } else { t.to_string() }
+    let t = one_line(title);
+    if t.is_empty() || (t.starts_with('[') && t.ends_with(']')) { name.to_string() } else { t }
+}
+
+/// Texte sur une seule ligne : les retours à la ligne et espaces multiples (fréquents dans les
+/// résumés du portail) deviennent un espace, pour ne pas déborder des lignes de hauteur fixe.
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn letter(s: &str) -> SharedString {
@@ -207,11 +213,11 @@ fn letter(s: &str) -> SharedString {
 }
 
 fn short(s: &str, max: usize) -> String {
-    let line = s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let line = one_line(s);
     if line.chars().count() > max {
         format!("{}…", line.chars().take(max).collect::<String>())
     } else {
-        line.to_string()
+        line
     }
 }
 
@@ -677,7 +683,7 @@ fn pack_add_rows(k: &Core, query: &str) -> Vec<AddRow> {
             rows.push(AddRow {
                 name: m.name.clone().into(),
                 title: display_title(&m.title, &m.name).into(),
-                info: format!("Portail  •  par {}  •  {ver}", m.owner).into(),
+                info: format!("Portail  •  par {}  •  {ver}", one_line(&m.owner)).into(),
                 installed: false,
             });
         }
@@ -1031,7 +1037,7 @@ fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<Str
             })
             .unwrap_or(0);
         let is_pack = portal::is_modpack_category(full.category.as_deref());
-        let title = if full.title.is_empty() { full.name.clone() } else { full.title.clone() };
+        let title = display_title(&full.title, &full.name);
         {
             let mut k = c.lock().unwrap();
             if k.dl_gen != generation {
@@ -1611,15 +1617,15 @@ fn wire_search(ui: &AppWindow, core: &Shared) {
                     .iter()
                     .map(|m| {
                         let rel = m.latest_release.as_ref();
-                        let title = if m.title.is_empty() { m.name.clone() } else { m.title.clone() };
+                        let title = display_title(&m.title, &m.name);
                         let thumb = k.portal_thumb_cached(&m.name);
                         let icon = load_image(thumb.as_ref());
                         SearchRow {
                             name: m.name.clone().into(),
                             letter: letter(&title),
                             title: title.into(),
-                            owner: m.owner.clone().into(),
-                            summary: m.summary.clone().into(),
+                            owner: one_line(&m.owner).into(),
+                            summary: short(&m.summary, 300).into(),
                             category: portal::category_label(m.category.as_deref().unwrap_or("")).into(),
                             is_modpack: portal::is_modpack_category(m.category.as_deref()),
                             downloads: thousands(m.downloads_count).into(),
