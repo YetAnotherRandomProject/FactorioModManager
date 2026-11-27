@@ -862,7 +862,7 @@ fn required_closure(
                 release: None,
                 installed: None,
                 checked: true,
-                checkable: false,
+                checkable: true,
                 status: String::new(),
             };
             if let Some(info) = installed {
@@ -880,11 +880,13 @@ fn required_closure(
                         }
                         None => {
                             item.checked = false;
+                            item.checkable = false;
                             item.status = format!("⚠ Aucune version compatible sur le portail • requis par {parent}");
                         }
                     },
                     Err(e) => {
                         item.checked = false;
+                        item.checkable = false;
                         item.status = format!("⚠ Introuvable sur le portail ({e}) • requis par {parent}");
                     }
                 }
@@ -957,6 +959,7 @@ fn load_dl_items(c: &Shared, w: &Weak<AppWindow>, version_index: usize) {
             d.version_index = version_index;
         }
         ui.set_dl_loading(false);
+        ui.set_dl_req_all(true);
         ui.set_dl_rec_all(false);
         ui.set_dl_opt_all(false);
         ui.set_dl_hidden_all(false);
@@ -964,11 +967,27 @@ fn load_dl_items(c: &Shared, w: &Weak<AppWindow>, version_index: usize) {
     });
 }
 
-fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<String>) {
+/// Modpack proposé par défaut dans la fenêtre de téléchargement / dépendances.
+enum DlTarget {
+    /// Le modpack sélectionné dans la vue Modpacks (recherche, ajout depuis un pack).
+    SelectedPack,
+    /// Aucun : uniquement le dépôt (fiche de la bibliothèque).
+    NoPack,
+    /// Un modpack précis (ouverture depuis une ligne du modpack).
+    Pack(String),
+}
+
+fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<String>, target: DlTarget) {
     {
         let k = core.lock().unwrap();
-        let idx = k.selected_pack.as_ref().and_then(|id| k.state.packs.iter().position(|p| &p.id == id));
+        let id = match target {
+            DlTarget::SelectedPack => k.selected_pack.clone(),
+            DlTarget::NoPack => None,
+            DlTarget::Pack(id) => Some(id),
+        };
+        let idx = id.and_then(|id| k.state.packs.iter().position(|p| p.id == id));
         ui.set_dl_target_index(idx.map(|i| i as i32 + 1).unwrap_or(0));
+        ui.set_dl_installed(k.index.contains_key(&name));
     }
     ui.set_dl_visible(true);
     ui.set_dl_loading(true);
@@ -1505,7 +1524,13 @@ fn wire_library(ui: &AppWindow, core: &Shared) {
     ui.on_download_update(move |name| {
         let ui = w.unwrap();
         let preset = c.lock().unwrap().updates.get(name.as_str()).map(|r| r.version.clone());
-        open_download(&ui, &c, name.to_string(), preset);
+        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_open_deps(move |name| {
+        let ui = w.unwrap();
+        let preset = c.lock().unwrap().index.get(name.as_str()).map(|v| v[0].version.to_string());
+        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_delete_version(move |name, version| {
@@ -1649,7 +1674,7 @@ fn wire_search(ui: &AppWindow, core: &Shared) {
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_open_download(move |name| {
         let ui = w.unwrap();
-        open_download(&ui, &c, name.to_string(), None);
+        open_download(&ui, &c, name.to_string(), None, DlTarget::SelectedPack);
     });
 }
 
@@ -1968,6 +1993,17 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
         task(&ui, &c, "Import du modpack…", move |c, w| import_pack(c, w, &src));
     });
     let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_pack_mod_deps(move |i| {
+        let ui = w.unwrap();
+        let (id, entry) = {
+            let k = c.lock().unwrap();
+            let Some(id) = k.selected_pack.clone() else { return };
+            let Some(e) = k.state.pack(&id).and_then(|p| p.mods.get(i as usize)).cloned() else { return };
+            (id, e)
+        };
+        open_download(&ui, &c, entry.name, Some(entry.version), DlTarget::Pack(id));
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
     ui.on_pack_mod_filter_changed(move || {
         let ui = w.unwrap();
         refresh_pack_detail(&ui, &c.lock().unwrap(), false);
@@ -1992,7 +2028,7 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
     ui.on_pack_add(move |name, installed| {
         let ui = w.unwrap();
         if !installed {
-            open_download(&ui, &c, name.to_string(), None);
+            open_download(&ui, &c, name.to_string(), None, DlTarget::SelectedPack);
             return;
         }
         let mut k = c.lock().unwrap();

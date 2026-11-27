@@ -345,7 +345,11 @@ export component AppWindow inherits Window {
     in property <[string]> dl-versions: [];
     in-out property <int> dl-version-index: 0;
     in property <[DepRow]> dl-deps: [];
+    in-out property <bool> dl-req-all: true;
     in-out property <bool> dl-rec-all: false;
+    in property <bool> dl-installed: false;
+    callback open-deps(string);
+    callback pack-mod-deps(int);
     in-out property <bool> dl-opt-all: false;
     in-out property <bool> dl-hidden-all: false;
     in property <[string]> dl-targets: [];
@@ -636,6 +640,12 @@ export component AppWindow inherits Window {
                                         text: "Page du portail";
                                         clicked => {
                                             root.open-portal(root.detail-name);
+                                        }
+                                    }
+                                    ActionButton {
+                                        text: "Dépendances…";
+                                        clicked => {
+                                            root.open-deps(root.detail-name);
                                         }
                                     }
                                     if root.detail-homepage != "": ActionButton {
@@ -1220,6 +1230,13 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                         Button {
+                                            width: 110px;
+                                            text: "Dépendances";
+                                            clicked => {
+                                                root.pack-mod-deps(m.index);
+                                            }
+                                        }
+                                        Button {
                                             width: 90px;
                                             text: "Retirer";
                                             clicked => {
@@ -1448,7 +1465,7 @@ export component AppWindow inherits Window {
         dialog-width: 760px;
         dialog-height: 640px;
         Text {
-            text: "Télécharger « " + root.dl-title + " »";
+            text: (root.dl-installed ? "Dépendances de « " : "Télécharger « ") + root.dl-title + " »";
             font-size: 18px;
             font-weight: 700;
             overflow: elide;
@@ -1483,9 +1500,11 @@ export component AppWindow inherits Window {
             spacing: 14px;
             alignment: start;
             CheckBox {
-                text: "Obligatoires (toujours inclus)";
-                checked: true;
-                enabled: false;
+                text: "Obligatoires";
+                checked <=> root.dl-req-all;
+                toggled => {
+                    root.dl-toggle-group(0, self.checked);
+                }
             }
             CheckBox {
                 text: "Recommandés";
@@ -1589,7 +1608,7 @@ export component AppWindow inherits Window {
                 }
             }
             ActionButton {
-                text: "Télécharger";
+                text: root.dl-installed ? "Valider" : "Télécharger";
                 primary: true;
                 enabled: !root.dl-loading && root.dl-versions.length > 0;
                 clicked => {
