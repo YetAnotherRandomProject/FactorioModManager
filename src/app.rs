@@ -97,6 +97,7 @@ pub struct Core {
     selected_mod: Option<String>,
     selected_pack: Option<String>,
     dl: Option<DlSession>,
+    dl_gen: u64,
     conflicts: Vec<Conflict>,
     conflict_sel: Vec<usize>,
     after_conflict: After,
@@ -977,9 +978,13 @@ enum DlTarget {
     Pack(String),
 }
 
-fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<String>, target: DlTarget) {
-    {
-        let k = core.lock().unwrap();
+/// Ouvre la sélection des dépendances d'un mod : dans une fenêtre (`overlay`) ou intégrée à la fiche
+/// de la bibliothèque.
+fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<String>, target: DlTarget, overlay: bool) {
+    let generation = {
+        let mut k = core.lock().unwrap();
+        k.dl_gen += 1;
+        k.dl = None;
         let id = match target {
             DlTarget::SelectedPack => k.selected_pack.clone(),
             DlTarget::NoPack => None,
@@ -988,8 +993,10 @@ fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<Str
         let idx = id.and_then(|id| k.state.packs.iter().position(|p| p.id == id));
         ui.set_dl_target_index(idx.map(|i| i as i32 + 1).unwrap_or(0));
         ui.set_dl_installed(k.index.contains_key(&name));
-    }
-    ui.set_dl_visible(true);
+        k.dl_gen
+    };
+    ui.set_dl_name(name.clone().into());
+    ui.set_dl_visible(overlay);
     ui.set_dl_loading(true);
     ui.set_dl_title(name.clone().into());
     ui.set_dl_info("Chargement des informations du portail…".into());
@@ -1027,6 +1034,9 @@ fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<Str
         let title = if full.title.is_empty() { full.name.clone() } else { full.title.clone() };
         {
             let mut k = c.lock().unwrap();
+            if k.dl_gen != generation {
+                return; // un autre mod a été sélectionné entre-temps
+            }
             k.dl = Some(DlSession {
                 name: full.name.clone(),
                 title: title.clone(),
@@ -1397,6 +1407,7 @@ pub fn run() -> Result<()> {
         selected_mod: None,
         selected_pack: None,
         dl: None,
+        dl_gen: 0,
         conflicts: vec![],
         conflict_sel: vec![],
         after_conflict: After::Nothing,
@@ -1490,8 +1501,11 @@ fn wire_library(ui: &AppWindow, core: &Shared) {
         let mut k = c.lock().unwrap();
         k.selected_mod = Some(name.to_string());
         ui.set_add_version_index(0);
-        ui.set_selected_mod(name);
+        ui.set_selected_mod(name.clone());
         refresh_detail(&ui, &k);
+        let preset = k.index.get(name.as_str()).map(|v| v[0].version.to_string());
+        drop(k);
+        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack, false);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_import_existing(move || {
@@ -1524,13 +1538,7 @@ fn wire_library(ui: &AppWindow, core: &Shared) {
     ui.on_download_update(move |name| {
         let ui = w.unwrap();
         let preset = c.lock().unwrap().updates.get(name.as_str()).map(|r| r.version.clone());
-        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack);
-    });
-    let (c, w) = (core.clone(), ui.as_weak());
-    ui.on_open_deps(move |name| {
-        let ui = w.unwrap();
-        let preset = c.lock().unwrap().index.get(name.as_str()).map(|v| v[0].version.to_string());
-        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack);
+        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack, true);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_delete_version(move |name, version| {
@@ -1674,7 +1682,7 @@ fn wire_search(ui: &AppWindow, core: &Shared) {
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_open_download(move |name| {
         let ui = w.unwrap();
-        open_download(&ui, &c, name.to_string(), None, DlTarget::SelectedPack);
+        open_download(&ui, &c, name.to_string(), None, DlTarget::SelectedPack, true);
     });
 }
 
@@ -1723,6 +1731,7 @@ fn wire_download(ui: &AppWindow, core: &Shared) {
         let ui = w.unwrap();
         c.lock().unwrap().dl = None;
         ui.set_dl_visible(false);
+        reselect_mod(&ui);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_dl_confirm(move || {
@@ -1733,14 +1742,27 @@ fn wire_download(ui: &AppWindow, core: &Shared) {
             let target = if idx > 0 { k.state.packs.get(idx as usize - 1).map(|p| p.id.clone()) } else { None };
             (target, k.dl.as_ref().map(|d| d.title.clone()).unwrap_or_default())
         };
-        let new_pack = (ui.get_dl_is_modpack() && ui.get_dl_make_pack()).then(|| {
+        // La création de modpack n'est proposée que dans la fenêtre.
+        let new_pack = (ui.get_dl_visible() && ui.get_dl_is_modpack() && ui.get_dl_make_pack()).then(|| {
             let n = ui.get_dl_pack_name().trim().to_string();
             if n.is_empty() { title.clone() } else { n }
         });
         let target = if new_pack.is_some() { None } else { target };
         ui.set_dl_visible(false);
-        task(&ui, &c, &format!("Téléchargement de {title}…"), move |c, w| confirm_download(c, w, target, new_pack));
+        task(&ui, &c, &format!("Téléchargement de {title}…"), move |c, w| {
+            let res = confirm_download(c, w, target, new_pack);
+            let _ = w.upgrade_in_event_loop(|ui| reselect_mod(&ui));
+            res
+        });
     });
+}
+
+/// Recharge la liste des dépendances intégrée à la fiche du mod sélectionné (bibliothèque).
+fn reselect_mod(ui: &AppWindow) {
+    let sel = ui.get_selected_mod();
+    if ui.get_page() == 0 && !sel.is_empty() && !ui.get_dl_visible() {
+        ui.invoke_select_mod(sel);
+    }
 }
 
 fn wire_packs(ui: &AppWindow, core: &Shared) {
@@ -2001,7 +2023,7 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
             let Some(e) = k.state.pack(&id).and_then(|p| p.mods.get(i as usize)).cloned() else { return };
             (id, e)
         };
-        open_download(&ui, &c, entry.name, Some(entry.version), DlTarget::Pack(id));
+        open_download(&ui, &c, entry.name, Some(entry.version), DlTarget::Pack(id), true);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_pack_mod_filter_changed(move || {
@@ -2027,19 +2049,15 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_pack_add(move |name, installed| {
         let ui = w.unwrap();
-        if !installed {
-            open_download(&ui, &c, name.to_string(), None, DlTarget::SelectedPack);
-            return;
-        }
-        let mut k = c.lock().unwrap();
-        let Some(id) = k.selected_pack.clone() else { return };
-        let Some(info) = k.index.get(name.as_str()).and_then(|v| v.first()).cloned() else { return };
-        let added = add_mod_to_pack(&mut k, &id, &info);
-        k.save_state();
+        // Dans tous les cas, on propose les dépendances avant d'ajouter le mod au modpack.
+        let preset = if installed {
+            c.lock().unwrap().index.get(name.as_str()).map(|v| v[0].version.to_string())
+        } else {
+            None
+        };
         ui.set_pack_add_query("".into());
         ui.set_pack_add_results(model(vec![]));
-        refresh_all(&ui, &k);
-        ui.set_status(format!("{} {} ajouté (+{added} dépendance(s)).", info.name, info.version).into());
+        open_download(&ui, &c, name.to_string(), preset, DlTarget::SelectedPack, true);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_browse_modpacks(move || {

@@ -348,7 +348,6 @@ export component AppWindow inherits Window {
     in-out property <bool> dl-req-all: true;
     in-out property <bool> dl-rec-all: false;
     in property <bool> dl-installed: false;
-    callback open-deps(string);
     callback pack-mod-deps(int);
     in-out property <bool> dl-opt-all: false;
     in-out property <bool> dl-hidden-all: false;
@@ -642,12 +641,6 @@ export component AppWindow inherits Window {
                                             root.open-portal(root.detail-name);
                                         }
                                     }
-                                    ActionButton {
-                                        text: "Dépendances…";
-                                        clicked => {
-                                            root.open-deps(root.detail-name);
-                                        }
-                                    }
                                     if root.detail-homepage != "": ActionButton {
                                         text: "Site du mod";
                                         clicked => {
@@ -700,34 +693,130 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 SectionTitle {
-                                    text: "Ajouter à un modpack";
+                                    text: "Dépendances et ajout à un modpack";
                                 }
-                                HorizontalLayout {
+                                if root.dl-name == root.detail-name: VerticalLayout {
                                     spacing: 6px;
-                                    ComboBox {
-                                        model: root.pack-names;
-                                        current-index <=> root.add-pack-index;
+                                    Text {
+                                        text: root.dl-loading ? "Chargement des dépendances depuis le portail…" : root.dl-info;
+                                        color: Theme.muted;
+                                        wrap: word-wrap;
                                     }
-                                    ComboBox {
-                                        width: 120px;
-                                        model: root.detail-version-names;
-                                        current-index <=> root.add-version-index;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "Version :";
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 0;
+                                        }
+                                        ComboBox {
+                                            model: root.dl-versions;
+                                            current-index <=> root.dl-version-index;
+                                            enabled: !root.dl-loading;
+                                            selected => {
+                                                root.dl-version-changed(self.current-index);
+                                            }
+                                        }
                                     }
-                                    ActionButton {
-                                        text: "Ajouter";
-                                        enabled: root.pack-names.length > 0;
-                                        clicked => {
-                                            root.add-to-pack(root.detail-name, root.add-pack-index, root.add-version-index);
+                                    HorizontalLayout {
+                                        spacing: 14px;
+                                        alignment: start;
+                                        CheckBox {
+                                            text: "Obligatoires";
+                                            checked <=> root.dl-req-all;
+                                            toggled => {
+                                                root.dl-toggle-group(0, self.checked);
+                                            }
+                                        }
+                                        CheckBox {
+                                            text: "Recommandés";
+                                            checked <=> root.dl-rec-all;
+                                            toggled => {
+                                                root.dl-toggle-group(1, self.checked);
+                                            }
+                                        }
+                                        CheckBox {
+                                            text: "Optionnels";
+                                            checked <=> root.dl-opt-all;
+                                            toggled => {
+                                                root.dl-toggle-group(2, self.checked);
+                                            }
+                                        }
+                                        CheckBox {
+                                            text: "Optionnels cachés";
+                                            checked <=> root.dl-hidden-all;
+                                            toggled => {
+                                                root.dl-toggle-group(3, self.checked);
+                                            }
+                                        }
+                                    }
+                                    for d[i] in root.dl-deps: Rectangle {
+                                        height: 40px;
+                                        border-radius: 6px;
+                                        background: Math.mod(i, 2) == 0 ? Palette.control-background : transparent;
+                                        HorizontalLayout {
+                                            padding-left: 6px;
+                                            padding-right: 6px;
+                                            spacing: 8px;
+                                            CheckBox {
+                                                horizontal-stretch: 0;
+                                                checked: d.checked;
+                                                enabled: d.checkable;
+                                                toggled => {
+                                                    root.dl-toggle-dep(i, self.checked);
+                                                }
+                                            }
+                                            VerticalLayout {
+                                                alignment: center;
+                                                Text {
+                                                    text: d.name + "  " + d.constraint;
+                                                    font-weight: 600;
+                                                    overflow: elide;
+                                                }
+                                                Text {
+                                                    text: d.status;
+                                                    color: d.group == 4 ? Theme.warn : Theme.muted;
+                                                    font-size: 11px;
+                                                    overflow: elide;
+                                                }
+                                            }
+                                            Badge {
+                                                height: 18px;
+                                                y: 11px;
+                                                text: d.kind;
+                                                bg: d.group == 0 ? Palette.accent-background : d.group == 1 ? Theme.ok : d.group == 4 ? Theme.warn : Palette.control-background;
+                                                fg: d.group == 0 ? Palette.accent-foreground : d.group == 1 ? white : d.group == 4 ? black : Palette.foreground;
+                                            }
+                                        }
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: "Ajouter au modpack :";
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 0;
+                                        }
+                                        ComboBox {
+                                            model: root.dl-targets;
+                                            current-index <=> root.dl-target-index;
+                                        }
+                                        ActionButton {
+                                            text: "Valider";
+                                            primary: true;
+                                            enabled: !root.dl-loading && root.dl-versions.length > 0;
+                                            clicked => {
+                                                root.dl-confirm();
+                                            }
                                         }
                                     }
                                 }
-                                SectionTitle {
-                                    text: "Dépendances";
-                                }
-                                for d in root.detail-deps: Text {
-                                    text: d;
-                                    color: Theme.muted;
-                                    wrap: word-wrap;
+                                if root.dl-deps.length == 0 && !root.dl-loading: VerticalLayout {
+                                    spacing: 2px;
+                                    for d in root.detail-deps: Text {
+                                        text: d;
+                                        color: Theme.muted;
+                                        wrap: word-wrap;
+                                    }
                                 }
                                 SectionTitle {
                                     text: "Description";
@@ -1188,7 +1277,14 @@ export component AppWindow inherits Window {
                                     for m[i] in root.pack-mods: Rectangle {
                                     height: 52px;
                                     border-radius: 6px;
-                                    background: Math.mod(i, 2) == 0 ? Palette.control-background : transparent;
+                                    background: Math.mod(i, 2) == 0 ? (row-ta.has-hover ? Palette.selection-background.transparentize(0.6) : Palette.control-background) : (row-ta.has-hover ? Palette.selection-background.transparentize(0.6) : transparent);
+                                    // Clic sur la ligne : dépendances du mod, ajoutées à ce modpack.
+                                    row-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.pack-mod-deps(m.index);
+                                        }
+                                    }
                                     HorizontalLayout {
                                         padding: 6px;
                                         spacing: 8px;
@@ -1227,13 +1323,6 @@ export component AppWindow inherits Window {
                                             checked: m.enabled;
                                             toggled => {
                                                 root.pack-mod-enabled(m.index, self.checked);
-                                            }
-                                        }
-                                        Button {
-                                            width: 110px;
-                                            text: "Dépendances";
-                                            clicked => {
-                                                root.pack-mod-deps(m.index);
                                             }
                                         }
                                         Button {
@@ -1533,6 +1622,12 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-color: Palette.border;
             border-radius: 6px;
+            if root.dl-deps.length == 0 && !root.dl-loading: Text {
+                text: "Aucune dépendance (hors jeu de base).";
+                color: Theme.muted;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
             ListView {
                 for d[i] in root.dl-deps: Rectangle {
                     height: 40px;
