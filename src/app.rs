@@ -63,6 +63,9 @@ struct DlSession {
     releases: Vec<Release>,
     version_index: usize,
     items: Vec<DlItem>,
+    /// Proposer « Créer un modpack à partir de ce mod » (jamais depuis un modpack existant :
+    /// on met alors simplement ce modpack à jour).
+    offer_pack: bool,
 }
 
 enum After {
@@ -572,7 +575,7 @@ fn refresh_dl(ui: &AppWindow, k: &Core) {
     let mut targets = vec!["Aucun (dépôt uniquement)".to_string()];
     targets.extend(k.state.packs.iter().map(|p| p.name.clone()));
     ui.set_dl_targets(strings(targets));
-    ui.set_dl_is_modpack(portal::is_modpack_category(dl.category.as_deref()));
+    ui.set_dl_is_modpack(dl.offer_pack && portal::is_modpack_category(dl.category.as_deref()));
 }
 
 fn refresh_settings(ui: &AppWindow, k: &Core) {
@@ -1005,6 +1008,7 @@ enum DlTarget {
 /// Ouvre la sélection des dépendances d'un mod : dans une fenêtre (`overlay`) ou intégrée à la fiche
 /// de la bibliothèque.
 fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<String>, target: DlTarget, overlay: bool) {
+    let offer_pack = !matches!(target, DlTarget::Pack(_));
     let generation = {
         let mut k = core.lock().unwrap();
         k.dl_gen += 1;
@@ -1082,6 +1086,7 @@ fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<Str
                 releases,
                 version_index: idx,
                 items: vec![],
+                offer_pack,
             });
         }
         let c2 = c.clone();
@@ -1089,7 +1094,7 @@ fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<Str
             let k = c2.lock().unwrap();
             refresh_dl(&ui, &k);
             ui.set_dl_loading(true);
-            ui.set_dl_make_pack(is_pack);
+            ui.set_dl_make_pack(is_pack && offer_pack);
             ui.set_dl_pack_name(title.into());
         });
         load_dl_items(&c, &w, idx);
@@ -2136,9 +2141,11 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
         } else {
             None
         };
+        let Some(id) = c.lock().unwrap().selected_pack.clone() else { return };
         ui.set_pack_add_query("".into());
         ui.set_pack_add_results(model(vec![]));
-        open_download(&ui, &c, name.to_string(), preset, DlTarget::SelectedPack, true);
+        // Ajout depuis la vue d'un modpack : on met à jour ce modpack, sans en proposer un nouveau.
+        open_download(&ui, &c, name.to_string(), preset, DlTarget::Pack(id), true);
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_browse_modpacks(move || {
