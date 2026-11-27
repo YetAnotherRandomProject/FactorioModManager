@@ -3511,20 +3511,27 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
             let s = k.config.feat_mod_settings.then(|| k.paths.pack_settings(&p.id));
             (p, s)
         };
-        let Some(dest) = rfd::FileDialog::new()
+        // Téléchargements par défaut : Documents est souvent protégé par l'« Accès contrôlé aux
+        // dossiers » de Windows, qui bloque silencieusement l'écriture.
+        let mut dlg = rfd::FileDialog::new()
             .add_filter("Modpack", &["fmpack"])
-            .set_file_name(format!("{}.fmpack", portal::sanitize(&pack.name)))
-            .save_file()
-        else {
-            return;
-        };
+            .set_file_name(format!("{}.fmpack", portal::sanitize(&pack.name)));
+        if let Some(d) = directories::UserDirs::new().and_then(|u| u.download_dir().map(|d| d.to_path_buf())) {
+            dlg = dlg.set_directory(d);
+        }
+        let Some(dest) = dlg.save_file() else { return };
         task(&ui, &c, "Export du modpack…", move |c, _| {
             let (index, include) = {
                 let k = c.lock().unwrap();
                 (k.index.clone(), k.config.export_include_mods)
             };
-            transfer::export(&pack, &dest, &index, settings.as_deref(), include)?;
-            Ok(format!("Modpack exporté vers {}.", dest.display()))
+            if let Err(e) = transfer::export(&pack, &dest, &index, settings.as_deref(), include) {
+                journal::log(format!("Échec de l'export de « {} » : {e:#}", pack.name));
+                return Err(e);
+            }
+            let msg = format!("Modpack exporté vers {}.", dest.display());
+            journal::log(&msg);
+            Ok(msg)
         });
     });
     let (c, w) = (core.clone(), ui.as_weak());

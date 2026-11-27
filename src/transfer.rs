@@ -29,7 +29,25 @@ struct Manifest {
 }
 
 pub fn export(pack: &Modpack, dest: &Path, index: &Index, settings: Option<&Path>, include_mods: bool) -> Result<()> {
-    let file = fs::File::create(dest).with_context(|| format!("création de {}", dest.display()))?;
+    let file = fs::File::create(dest).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            anyhow::anyhow!(
+                "Windows refuse l'écriture dans {} (accès refusé). Si l'« Accès contrôlé aux dossiers » \
+                 est activé, autorisez Factorio Mod Manager dans Sécurité Windows ou choisissez un autre dossier.",
+                dest.parent().unwrap_or(dest).display()
+            )
+        } else {
+            anyhow::Error::new(e).context(format!("création de {}", dest.display()))
+        }
+    })?;
+    let res = write_pack(file, pack, index, settings, include_mods);
+    if res.is_err() {
+        let _ = fs::remove_file(dest);
+    }
+    res
+}
+
+fn write_pack(file: fs::File, pack: &Modpack, index: &Index, settings: Option<&Path>, include_mods: bool) -> Result<()> {
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
