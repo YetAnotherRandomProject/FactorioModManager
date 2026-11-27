@@ -13,6 +13,9 @@ export struct ModRow {
     packs: string,
     active: bool,
     incompatible: bool,
+    checked: bool,
+    downloading: bool,
+    progress: float,
 }
 
 export struct VersionRow {
@@ -71,6 +74,8 @@ export struct PackModRow {
     version-index: int,
     enabled: bool,
     missing: bool,
+    downloading: bool,
+    progress: float,
 }
 
 export struct BuiltinRow {
@@ -192,13 +197,30 @@ component ModCard inherits Rectangle {
     in property <ModRow> data;
     in property <bool> selected;
     callback clicked;
+    callback check-toggled(bool);
     height: 72px;
     border-radius: 6px;
     background: root.selected ? Palette.selection-background : ta.has-hover ? Theme.card : transparent;
+    // Sous le contenu : le clic sur la ligne ouvre la fiche, la case à cocher reste cliquable.
+    ta := TouchArea {
+        enabled: !root.data.downloading;
+        clicked => {
+            root.clicked();
+        }
+    }
     HorizontalLayout {
         padding: 8px;
         spacing: 10px;
+        CheckBox {
+            width: 24px;
+            checked: root.data.checked;
+            enabled: !root.data.downloading;
+            toggled => {
+                root.check-toggled(self.checked);
+            }
+        }
         ModIcon {
+            opacity: root.data.downloading ? 0.4 : 1;
             icon: root.data.icon;
             has-icon: root.data.has-icon;
             letter: root.data.letter;
@@ -210,7 +232,7 @@ component ModCard inherits Rectangle {
                 text: root.data.title;
                 font-weight: 700;
                 overflow: elide;
-                color: root.selected ? Palette.selection-foreground : Palette.foreground;
+                color: root.data.downloading ? Theme.muted : root.selected ? Palette.selection-foreground : Palette.foreground;
             }
             Text {
                 text: root.data.summary;
@@ -236,26 +258,31 @@ component ModCard inherits Rectangle {
                 horizontal-alignment: right;
                 overflow: elide;
             }
-            if root.data.active: Badge {
+            if root.data.downloading: ProgressIndicator {
+                height: 6px;
+                progress: root.data.progress;
+            }
+            if root.data.downloading: Text {
+                text: Math.round(root.data.progress * 100) + " %";
+                color: Theme.muted;
+                font-size: 11px;
+                horizontal-alignment: right;
+            }
+            if !root.data.downloading && root.data.active: Badge {
                 text: "actif";
                 bg: Theme.ok;
                 fg: white;
             }
-            if root.data.update != "": Badge {
+            if !root.data.downloading && root.data.update != "": Badge {
                 text: "MàJ " + root.data.update;
                 bg: Theme.warn;
                 fg: black;
             }
-            if root.data.incompatible: Badge {
+            if !root.data.downloading && root.data.incompatible: Badge {
                 text: "incompatible";
                 bg: #d0453a;
                 fg: white;
             }
-        }
-    }
-    ta := TouchArea {
-        clicked => {
-            root.clicked();
         }
     }
 }
@@ -335,6 +362,14 @@ export component AppWindow inherits Window {
     callback delete-version(string, string);
     callback use-version-everywhere(string, string);
     callback add-to-pack(string, int, int);
+    in property <int> lib-selected-count: 0;
+    in-out property <int> bulk-pack-index: 0;
+    callback lib-toggle(string, bool);
+    callback lib-select-all();
+    callback bulk-clear();
+    callback bulk-add();
+    callback bulk-remove();
+    callback bulk-delete();
 
     // ---------- Recherche ----------
     in-out property <string> search-query: "";
@@ -540,12 +575,64 @@ export component AppWindow inherits Window {
             Rectangle {
                 vertical-stretch: 1;
                 // ===== Bibliothèque =====
-                if root.page == 0: HorizontalLayout {
+                if root.page == 0: VerticalLayout {
                     padding: 14px;
+                    spacing: 8px;
+                    if root.lib-selected-count > 0: Rectangle {
+                        height: 48px;
+                        border-radius: 8px;
+                        background: Theme.card;
+                        HorizontalLayout {
+                            padding: 8px;
+                            spacing: 6px;
+                            Text {
+                                text: root.lib-selected-count + " mod(s) sélectionné(s)";
+                                font-weight: 700;
+                                vertical-alignment: center;
+                                horizontal-stretch: 0;
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+                            ComboBox {
+                                width: 220px;
+                                model: root.pack-names;
+                                current-index <=> root.bulk-pack-index;
+                            }
+                            ActionButton {
+                                text: "Ajouter au modpack";
+                                primary: true;
+                                enabled: root.pack-names.length > 0;
+                                clicked => {
+                                    root.bulk-add();
+                                }
+                            }
+                            ActionButton {
+                                text: "Retirer du modpack";
+                                enabled: root.pack-names.length > 0;
+                                clicked => {
+                                    root.bulk-remove();
+                                }
+                            }
+                            ActionButton {
+                                text: "Supprimer du dépôt";
+                                clicked => {
+                                    root.bulk-delete();
+                                }
+                            }
+                            ActionButton {
+                                text: "Désélectionner";
+                                clicked => {
+                                    root.bulk-clear();
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
                     spacing: 14px;
                     VerticalLayout {
                         spacing: 8px;
-                        width: root.detail-visible ? 44% * parent.width : parent.width - 28px;
+                        width: root.detail-visible ? 44% * parent.width : parent.width;
                         HorizontalLayout {
                             spacing: 6px;
                             LineEdit {
@@ -591,10 +678,22 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Text {
-                            text: root.library.length + " / " + root.library-total + " mod(s)";
-                            color: Theme.muted;
-                            font-size: 12px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                text: root.library.length + " / " + root.library-total + " mod(s)";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                width: 150px;
+                                height: 28px;
+                                text: "Tout sélectionner";
+                                clicked => {
+                                    root.lib-select-all();
+                                }
+                            }
                         }
                         ListView {
                             for row in root.library: ModCard {
@@ -602,6 +701,9 @@ export component AppWindow inherits Window {
                                 selected: row.name == root.selected-mod;
                                 clicked => {
                                     root.select-mod(row.name);
+                                }
+                                check-toggled(on) => {
+                                    root.lib-toggle(row.name, on);
                                 }
                             }
                         }
@@ -843,6 +945,8 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
+
                 }
 
                 // ===== Recherche =====
@@ -1352,15 +1456,22 @@ export component AppWindow inherits Window {
                                                 text: m.title;
                                                 font-weight: 600;
                                                 overflow: elide;
+                                                color: m.downloading ? Theme.muted : Palette.foreground;
                                             }
                                             Text {
-                                                text: m.missing ? m.name + " — absent du dépôt" : m.name;
+                                                text: m.downloading ? m.name + " — téléchargement " + Math.round(m.progress * 100) + " %" : m.missing ? m.name + " — absent du dépôt" : m.name;
                                                 color: m.missing ? Theme.warn : Theme.muted;
                                                 font-size: 11px;
                                                 overflow: elide;
                                             }
                                         }
-                                        ComboBox {
+                                        if m.downloading: ProgressIndicator {
+                                            width: 120px;
+                                            height: 6px;
+                                            y: 20px;
+                                            progress: m.progress;
+                                        }
+                                        if !m.downloading: ComboBox {
                                             width: 120px;
                                             model: m.versions;
                                             current-index: m.version-index;

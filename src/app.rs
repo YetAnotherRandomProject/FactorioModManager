@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel, Weak};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,6 +78,16 @@ enum Confirm {
     Sync(SyncPlan, Option<PathBuf>),
     DeletePack(String),
     DeleteVersion(String, Version),
+    /// Suppression groupée du dépôt (mods non utilisés par un modpack).
+    BulkDelete(Vec<String>),
+}
+
+/// Mod en cours de téléchargement, affiché grisé avec sa progression dans les listes.
+#[derive(Clone, Debug)]
+struct Pending {
+    version: String,
+    title: String,
+    progress: f32,
 }
 
 pub struct Core {
@@ -105,6 +115,10 @@ pub struct Core {
     conflict_sel: Vec<usize>,
     after_conflict: After,
     confirm: Option<Confirm>,
+    /// Mods cochés dans la bibliothèque pour une action groupée.
+    lib_selection: BTreeSet<String>,
+    /// Téléchargements en cours, par nom de mod.
+    pending: BTreeMap<String, Pending>,
 }
 
 impl Core {
@@ -335,10 +349,37 @@ fn refresh_library(ui: &AppWindow, k: &Core) {
             packs: packs.join(", ").into(),
             active,
             incompatible: !game.is_empty() && !factorio_compatible(&latest.factorio_version, &game),
+            checked: k.lib_selection.contains(name),
+            downloading: k.pending.contains_key(name),
+            progress: k.pending.get(name).map(|p| p.progress).unwrap_or(0.0),
+        });
+    }
+    // Mods pas encore dans le dépôt : affichés grisés pendant leur téléchargement.
+    for (name, p) in k.pending.iter().filter(|(n, _)| !k.index.contains_key(*n)) {
+        if !filter.is_empty() && !name.to_lowercase().contains(&filter) && !p.title.to_lowercase().contains(&filter) {
+            continue;
+        }
+        rows.push(ModRow {
+            name: name.into(),
+            letter: letter(&p.title),
+            title: p.title.clone().into(),
+            summary: "Téléchargement en cours…".into(),
+            has_icon: false,
+            icon: Image::default(),
+            version: p.version.clone().into(),
+            versions_count: 0,
+            update: "".into(),
+            packs: k.state.packs_using(name, None).join(", ").into(),
+            active: false,
+            incompatible: false,
+            checked: false,
+            downloading: true,
+            progress: p.progress,
         });
     }
     rows.sort_by_key(|r| r.title.to_lowercase());
     ui.set_library_total(k.index.len() as i32);
+    ui.set_lib_selected_count(k.lib_selection.len() as i32);
     ui.set_library(model(rows));
     ui.set_selected_mod(k.selected_mod.clone().unwrap_or_default().into());
 }
@@ -486,7 +527,9 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
                 versions: strings(versions),
                 version_index: idx as i32,
                 enabled: e.enabled,
-                missing: info.is_none(),
+                missing: info.is_none() && !k.pending.contains_key(&e.name),
+                downloading: k.pending.contains_key(&e.name),
+                progress: k.pending.get(&e.name).map(|p| p.progress).unwrap_or(0.0),
             })
         })
         .collect();
@@ -1166,62 +1209,155 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
         }
     }
 
-    let to_download: Vec<&Release> = wanted.iter().filter_map(|(_, _, r)| r.as_ref()).collect();
-    if !to_download.is_empty() {
-        let (user, token) = creds.ok_or_else(|| {
+    let jobs: Vec<(String, Release)> =
+        wanted.iter().filter_map(|(n, _, r)| r.clone().map(|r| (n.clone(), r))).collect();
+    let creds = if jobs.is_empty() {
+        None
+    } else {
+        Some(creds.ok_or_else(|| {
             anyhow!("identifiants du portail introuvables : connecte-toi au portail dans Factorio ou renseigne-les dans Paramètres")
-        })?;
-        let n = to_download.len();
-        for (i, rel) in to_download.iter().enumerate() {
-            post_status(w, format!("Téléchargement {}/{n} : {}", i + 1, rel.file_name));
-            let w2 = w.clone();
-            let path = portal.download(rel, &user, &token, &downloads, |done, total| {
-                if total > 0 {
-                    let overall = (i as f32 + done as f32 / total as f32) / n as f32;
-                    post_progress(&w2, overall);
+        })?)
+    };
+
+    // 1. Le modpack (nouveau ou existant) reçoit tout de suite la liste complète, et les mods à
+    //    télécharger apparaissent grisés dans les listes.
+    let mut msg = String::new();
+    {
+        let mut k = c.lock().unwrap();
+        let pack_id = if let Some(name) = new_pack {
+            let mut p = Modpack::new(&name);
+            p.base_mod = Some(dl.name.clone());
+            if k.config.feat_factorio_version {
+                let f = main.factorio();
+                p.factorio_version = if f.is_empty() { None } else { Some(f) };
+            }
+            let id = p.id.clone();
+            k.state.packs.push(p);
+            msg.push_str(&format!(", modpack « {name} » créé"));
+            Some(id)
+        } else {
+            target_pack
+        };
+        if let Some(id) = pack_id {
+            if let Some(p) = k.state.pack_mut(&id) {
+                for (n, v, _) in &wanted {
+                    p.set_mod(n, v);
                 }
-            })?;
-            store.add_file(&path, AddMode::Move)?;
+                if msg.is_empty() {
+                    msg.push_str(&format!(", ajouté(s) à « {} »", p.name));
+                }
+            }
+            k.selected_pack = Some(id);
         }
+        for (name, rel) in &jobs {
+            let title = if *name == dl.name { dl.title.clone() } else { name.clone() };
+            k.pending.insert(name.clone(), Pending { version: rel.version.clone(), title, progress: 0.0 });
+        }
+        k.dl = None;
+        k.save_state();
     }
-    rescan(c);
+    post_refresh(w, c);
+
+    // 2. Téléchargements en parallèle ; chaque mod rejoint le dépôt dès qu'il est prêt.
+    let failed = download_jobs(c, w, &portal, &store, &downloads, creds, jobs.clone());
 
     let mut k = c.lock().unwrap();
-    let mut msg = format!("{} mod(s) téléchargé(s)", to_download.len());
-    if !skipped.is_empty() {
-        msg.push_str(&format!(" ({} ignoré(s), sans version pour Factorio {target} : {})", skipped.len(), skipped.join(", ")));
+    let ok = jobs.len() - failed.len();
+    let mut out = format!("{ok} mod(s) téléchargé(s){msg}");
+    if !failed.is_empty() {
+        out.push_str(&format!(" — échecs : {}", failed.join(", ")));
     }
-    let pack_id = if let Some(name) = new_pack {
-        let mut p = Modpack::new(&name);
-        p.base_mod = Some(dl.name.clone());
-        if k.config.feat_factorio_version {
-            let f = main.factorio();
-            p.factorio_version = if f.is_empty() { None } else { Some(f) };
-        }
-        let id = p.id.clone();
-        k.state.packs.push(p);
-        msg.push_str(&format!(", modpack « {name} » créé"));
-        Some(id)
-    } else {
-        target_pack
-    };
-    if let Some(id) = pack_id {
-        if let Some(p) = k.state.pack_mut(&id) {
-            for (n, v, _) in &wanted {
-                p.set_mod(n, v);
-            }
-            if !msg.contains("créé") {
-                msg.push_str(&format!(", ajouté(s) à « {} »", p.name));
-            }
-        }
-        k.selected_pack = Some(id);
+    if !skipped.is_empty() {
+        out.push_str(&format!(" ({} ignoré(s), sans version pour Factorio {target} : {})", skipped.len(), skipped.join(", ")));
     }
     let core = &mut *k;
     let index = &core.index;
     core.updates.retain(|name, r| index.get(name).map(|v| r.ver() > v[0].version).unwrap_or(true));
-    k.dl = None;
     k.save_state();
-    Ok(msg + ".")
+    Ok(out + ".")
+}
+
+/// Nombre de téléchargements simultanés.
+const PARALLEL_DOWNLOADS: usize = 4;
+
+/// Télécharge les releases en parallèle, ajoute chaque zip au dépôt et met à jour les listes au fur
+/// et à mesure (progression par mod). Renvoie les mods en échec.
+fn download_jobs(
+    c: &Shared,
+    w: &Weak<AppWindow>,
+    portal: &Portal,
+    store: &Store,
+    downloads: &Path,
+    creds: Option<(String, String)>,
+    jobs: Vec<(String, Release)>,
+) -> Vec<String> {
+    let Some((user, token)) = creds else { return vec![] };
+    let total = jobs.len();
+    let queue = Mutex::new(jobs.into_iter());
+    let done = AtomicUsize::new(0);
+    let failed = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..PARALLEL_DOWNLOADS.min(total) {
+            s.spawn(|| loop {
+                let Some((name, rel)) = queue.lock().unwrap().next() else { break };
+                let mut last = Instant::now();
+                let result = portal
+                    .download(&rel, &user, &token, downloads, |got, size| {
+                        if size > 0 && last.elapsed() >= Duration::from_millis(150) {
+                            last = Instant::now();
+                            post_mod_progress(w, c, &name, got as f32 / size as f32);
+                        }
+                    })
+                    .and_then(|path| store.add_file(&path, AddMode::Move));
+                let icon = result.as_ref().ok().and_then(|info| store.icon(info));
+                {
+                    let mut k = c.lock().unwrap();
+                    k.pending.remove(&name);
+                    match result {
+                        Ok(info) => {
+                            if let Some(p) = icon {
+                                k.icons.insert(info.name.clone(), p);
+                            }
+                            let list = k.index.entry(info.name.clone()).or_default();
+                            list.retain(|m| m.version != info.version);
+                            list.push(info);
+                            list.sort_by(|a, b| b.version.cmp(&a.version));
+                        }
+                        Err(e) => failed.lock().unwrap().push(format!("{name} ({e})")),
+                    }
+                }
+                let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+                post_status(w, format!("Téléchargement : {n}/{total} terminé(s)"));
+                post_progress(w, n as f32 / total as f32);
+                post_refresh(w, c);
+            });
+        }
+    });
+    failed.into_inner().unwrap()
+}
+
+/// Met à jour la barre de progression d'un mod dans les listes, sans reconstruire les modèles.
+fn post_mod_progress(w: &Weak<AppWindow>, c: &Shared, name: &str, progress: f32) {
+    let (c, name) = (c.clone(), name.to_string());
+    let _ = w.upgrade_in_event_loop(move |ui| {
+        if let Some(p) = c.lock().unwrap().pending.get_mut(&name) {
+            p.progress = progress;
+        }
+        let lib = ui.get_library();
+        for i in 0..lib.row_count() {
+            if let Some(mut r) = lib.row_data(i).filter(|r| r.name.as_str() == name) {
+                r.progress = progress;
+                lib.set_row_data(i, r);
+            }
+        }
+        let mods = ui.get_pack_mods();
+        for i in 0..mods.row_count() {
+            if let Some(mut r) = mods.row_data(i).filter(|r| r.name.as_str() == name) {
+                r.progress = progress;
+                mods.set_row_data(i, r);
+            }
+        }
+    });
 }
 
 fn import_existing(c: &Shared, w: &Weak<AppWindow>) -> Result<String> {
@@ -1469,6 +1605,8 @@ pub fn run() -> Result<()> {
         conflict_sel: vec![],
         after_conflict: After::Nothing,
         confirm: None,
+        lib_selection: BTreeSet::new(),
+        pending: BTreeMap::new(),
     };
     core.refresh_factorio();
     core.selected_pack = core.state.packs.first().map(|p| p.id.clone());
@@ -1582,6 +1720,110 @@ fn wire_library(ui: &AppWindow, core: &Shared) {
             fetch_missing_icons(c);
             Ok("Dépôt actualisé.".into())
         });
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_lib_toggle(move |name, on| {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        if on {
+            k.lib_selection.insert(name.to_string());
+        } else {
+            k.lib_selection.remove(name.as_str());
+        }
+        // Mise à jour de la seule ligne : reconstruire la liste ferait perdre le défilement.
+        let lib = ui.get_library();
+        for i in 0..lib.row_count() {
+            if let Some(mut r) = lib.row_data(i).filter(|r| r.name == name) {
+                r.checked = on;
+                lib.set_row_data(i, r);
+            }
+        }
+        ui.set_lib_selected_count(k.lib_selection.len() as i32);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_lib_select_all(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let lib = ui.get_library();
+        for i in 0..lib.row_count() {
+            if let Some(r) = lib.row_data(i).filter(|r| !r.downloading) {
+                k.lib_selection.insert(r.name.to_string());
+            }
+        }
+        refresh_library(&ui, &k);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_bulk_clear(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        k.lib_selection.clear();
+        refresh_library(&ui, &k);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_bulk_add(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let Some((id, pname)) =
+            k.state.packs.get(ui.get_bulk_pack_index().max(0) as usize).map(|p| (p.id.clone(), p.name.clone()))
+        else {
+            ui.set_status("Crée d'abord un modpack.".into());
+            return;
+        };
+        let infos: Vec<store::ModInfo> =
+            k.lib_selection.iter().filter_map(|n| k.index.get(n).map(|v| v[0].clone())).collect();
+        let mut deps = 0;
+        for info in &infos {
+            deps += add_mod_to_pack(&mut k, &id, info);
+        }
+        k.save_state();
+        refresh_all(&ui, &k);
+        ui.set_status(format!("{} mod(s) ajouté(s) à « {pname} » (+{deps} dépendance(s)).", infos.len()).into());
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_bulk_remove(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let idx = ui.get_bulk_pack_index().max(0) as usize;
+        let selection = k.lib_selection.clone();
+        let Some(pack) = k.state.packs.get_mut(idx) else { return };
+        let before = pack.mods.len();
+        pack.mods.retain(|e| !selection.contains(&e.name));
+        let (n, pname) = (before - pack.mods.len(), pack.name.clone());
+        k.save_state();
+        refresh_all(&ui, &k);
+        ui.set_status(format!("{n} mod(s) retiré(s) de « {pname} ».").into());
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_bulk_delete(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let (used, free): (Vec<String>, Vec<String>) = k
+            .lib_selection
+            .iter()
+            .filter(|n| k.index.contains_key(*n))
+            .cloned()
+            .partition(|n| !k.state.packs_using(n, None).is_empty());
+        if free.is_empty() {
+            ui.set_status("Les mods sélectionnés sont tous utilisés par un modpack : retire-les d'abord des modpacks.".into());
+            return;
+        }
+        let mut text = format!(
+            "{} mod(s) et toutes leurs versions seront supprimés définitivement du dépôt :\n{}",
+            free.len(),
+            free.join(", ")
+        );
+        if !used.is_empty() {
+            text.push_str(&format!(
+                "\n\n{} mod(s) utilisé(s) par un modpack ne seront pas supprimés :\n{}",
+                used.len(),
+                used.join(", ")
+            ));
+        }
+        ui.set_confirm_title(format!("Supprimer {} mod(s) du dépôt ?", free.len()).into());
+        ui.set_confirm_text(text.into());
+        ui.set_confirm_ok("Supprimer".into());
+        ui.set_confirm_visible(true);
+        k.confirm = Some(Confirm::BulkDelete(free));
     });
     ui.on_open_portal(|name| {
         let _ = open::that(format!("https://mods.factorio.com/mod/{}", portal::urlencode(&name)));
@@ -2291,6 +2533,31 @@ fn wire_dialogs(ui: &AppWindow, core: &Shared) {
                 refresh_all(&ui, &k);
                 refresh_pack_detail(&ui, &k, true);
                 ui.set_status("Modpack supprimé.".into());
+            }
+            Some(Confirm::BulkDelete(names)) => {
+                let mut k = c.lock().unwrap();
+                let mut removed = 0;
+                let mut errors = Vec::new();
+                for name in &names {
+                    for info in k.index.get(name).cloned().unwrap_or_default() {
+                        match k.store.remove(&info) {
+                            Ok(()) => removed += 1,
+                            Err(e) => errors.push(format!("{} {} ({e})", info.name, info.version)),
+                        }
+                    }
+                    k.index.remove(name);
+                    k.icons.remove(name);
+                    k.lib_selection.remove(name);
+                    if k.selected_mod.as_deref() == Some(name.as_str()) {
+                        k.selected_mod = None;
+                    }
+                }
+                refresh_all(&ui, &k);
+                let mut msg = format!("{} mod(s) supprimé(s) du dépôt ({removed} fichier(s)).", names.len());
+                if !errors.is_empty() {
+                    msg.push_str(&format!(" Erreurs : {}", errors.join(", ")));
+                }
+                ui.set_status(msg.into());
             }
             Some(Confirm::DeleteVersion(name, v)) => {
                 let mut k = c.lock().unwrap();
