@@ -168,38 +168,98 @@ pub fn resolve(state: &State, choices: &BTreeMap<String, String>) -> Resolution 
     res
 }
 
-/// Problèmes de dépendances dans une résolution (mods absents du dépôt, dépendances manquantes...).
-pub fn check(res: &Resolution, index: &Index, builtins: &[String]) -> Vec<String> {
+/// Problème détecté dans un ensemble de mods, avec les mods dont la désactivation le résout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Issue {
+    pub text: String,
+    /// Un seul candidat : correction automatique possible. Deux (incompatibilité) : au choix.
+    pub disable: Vec<String>,
+}
+
+impl Issue {
+    pub fn is_automatic(&self) -> bool {
+        self.disable.len() == 1
+    }
+}
+
+/// Problèmes d'une résolution : mods absents du dépôt, prévus pour une autre version de Factorio,
+/// dépendances obligatoires manquantes ou de mauvaise version, DLC requis désactivé, incompatibilités.
+/// `game` : version du jeu installé (vide = pas de contrôle de version).
+pub fn issues(res: &Resolution, index: &Index, builtins: &[String], game: &str) -> Vec<Issue> {
     let mut out = Vec::new();
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
     for (name, ver) in &res.mods {
+        let one = |text: String| Issue { text, disable: vec![name.clone()] };
         let Some(info) = crate::store::find(index, name, ver) else {
-            out.push(format!("{name} {ver} n'est pas dans le dépôt (à télécharger)"));
+            out.push(one(format!("{name} {ver} n'est pas dans le dépôt")));
             continue;
         };
+        if !crate::version::factorio_compatible(&info.factorio_version, game) {
+            out.push(one(format!(
+                "{name} {ver} est prévu pour Factorio {} (jeu installé : {game})",
+                info.factorio_version
+            )));
+        }
         for dep in info.deps() {
             if is_builtin(&dep.name, builtins) {
                 if dep.kind.is_required() && res.disabled_builtins.contains(&dep.name) {
-                    out.push(format!("{name} requiert {} qui est désactivé", dep.name));
+                    out.push(one(format!("{name} requiert {} qui est désactivé", dep.name)));
                 }
                 continue;
             }
             let present = res.mods.get(&dep.name);
             if dep.kind.is_required() {
                 match present {
-                    None => out.push(format!("{name} requiert {} {}", dep.name, dep.constraint_str())),
-                    Some(v) if !dep.matches(v) => out.push(format!(
+                    None => out.push(one(format!("{name} requiert {} {}", dep.name, dep.constraint_str()))),
+                    Some(v) if !dep.matches(v) => out.push(one(format!(
                         "{name} requiert {} {} (version chargée : {v})",
                         dep.name,
                         dep.constraint_str()
-                    )),
+                    ))),
                     _ => {}
                 }
             } else if dep.kind == crate::version::DepKind::Incompatible && present.is_some() {
-                out.push(format!("{name} est incompatible avec {}", dep.name));
+                // Une seule entrée par paire, même si les deux mods se déclarent incompatibles.
+                let pair = if *name < dep.name { (name.clone(), dep.name.clone()) } else { (dep.name.clone(), name.clone()) };
+                if pairs.insert(pair) {
+                    out.push(Issue {
+                        text: format!("{name} est incompatible avec {}", dep.name),
+                        disable: vec![name.clone(), dep.name.clone()],
+                    });
+                }
             }
         }
     }
     out
+}
+
+/// Désactive dans le modpack tous les mods en cause d'un problème à candidat unique, jusqu'à ce
+/// qu'il n'en reste plus (un mod qui dépendait d'un mod désactivé l'est à son tour).
+/// Les incompatibilités, qui demandent un choix, ne sont pas traitées. Renvoie les mods désactivés.
+pub fn auto_disable(pack: &mut Modpack, index: &Index, builtins: &[String], game: &str) -> Vec<String> {
+    let mut disabled = Vec::new();
+    loop {
+        let single = State { packs: vec![pack.clone()], active: vec![pack.id.clone()], ..Default::default() };
+        let res = resolve(&single, &BTreeMap::new());
+        let names: BTreeSet<String> = issues(&res, index, builtins, game)
+            .into_iter()
+            .filter(Issue::is_automatic)
+            .flat_map(|i| i.disable)
+            .collect();
+        if names.is_empty() {
+            return disabled;
+        }
+        for e in pack.mods.iter_mut().filter(|e| e.enabled && names.contains(&e.name)) {
+            e.enabled = false;
+            disabled.push(e.name.clone());
+        }
+    }
+}
+
+/// Problèmes d'un modpack pris seul.
+pub fn pack_issues(pack: &Modpack, index: &Index, builtins: &[String], game: &str) -> Vec<Issue> {
+    let single = State { packs: vec![pack.clone()], active: vec![pack.id.clone()], ..Default::default() };
+    issues(&resolve(&single, &BTreeMap::new()), index, builtins, game)
 }
 
 #[cfg(test)]
@@ -235,6 +295,45 @@ mod tests {
         let r = resolve(&s, &choices);
         assert!(r.conflicts.is_empty());
         assert_eq!(r.mods["flib"], Version(0, 15, 0));
+    }
+
+    fn info(name: &str, ver: &str, fv: &str, deps: &[&str]) -> crate::store::ModInfo {
+        crate::store::ModInfo {
+            name: name.into(),
+            version: ver.parse().unwrap(),
+            title: String::new(),
+            author: String::new(),
+            description: String::new(),
+            factorio_version: fv.into(),
+            dependencies: deps.iter().map(|d| d.to_string()).collect(),
+            homepage: String::new(),
+            path: Default::default(),
+        }
+    }
+
+    #[test]
+    fn auto_disable_cascades_and_leaves_incompatibilities() {
+        let mut index = Index::new();
+        // old : prévu pour 2.0 -> à désactiver ; uses-old en dépend -> désactivé en cascade
+        index.insert("old".into(), vec![info("old", "1.0.0", "2.0", &["base"])]);
+        index.insert("uses-old".into(), vec![info("uses-old", "1.0.0", "2.1", &["base", "old"])]);
+        // a et b s'excluent : au choix de l'utilisateur
+        index.insert("a".into(), vec![info("a", "1.0.0", "2.1", &["base", "! b"])]);
+        index.insert("b".into(), vec![info("b", "1.0.0", "2.1", &["base", "!a"])]);
+        index.insert("ok".into(), vec![info("ok", "1.0.0", "2.1", &["base"])]);
+        let mut p = pack("P", &[("old", "1.0.0"), ("uses-old", "1.0.0"), ("a", "1.0.0"), ("b", "1.0.0"), ("ok", "1.0.0")]);
+        let builtins = vec!["base".to_string()];
+
+        let before = pack_issues(&p, &index, &builtins, "2.1");
+        assert_eq!(before.iter().filter(|i| !i.is_automatic()).count(), 1, "une seule entrée pour la paire a/b");
+
+        let mut off = auto_disable(&mut p, &index, &builtins, "2.1");
+        off.sort();
+        assert_eq!(off, vec!["old".to_string(), "uses-old".to_string()]);
+        let after = pack_issues(&p, &index, &builtins, "2.1");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].disable, vec!["a".to_string(), "b".to_string()]);
+        assert!(p.entry("ok").unwrap().enabled);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Contrôleur : relie l'interface Slint au cœur (dépôt, portail, modpacks, synchro).
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use slint::{ComponentHandle, Image, Model, ModelRc, SharedString, VecModel, Weak};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,9 +18,9 @@ use crate::store::{self, AddMode, Index, Store};
 use crate::sync::{self, SyncPlan};
 use crate::transfer;
 use crate::updater::{self, AppRelease};
-use crate::version::{DepKind, Dependency, Version, is_builtin, same_major_minor};
+use crate::version::{DepKind, Dependency, Version, factorio_compatible, is_builtin, same_major_minor};
 use crate::{
-    AddRow, AppWindow, BuiltinRow, ConflictRow, DepRow, ModRow, PackModRow, PackRow, SaveRow, SearchRow, VersionRow,
+    AddRow, AppWindow, IssueRow, BuiltinRow, ConflictRow, DepRow, ModRow, PackModRow, PackRow, SaveRow, SearchRow, VersionRow,
 };
 
 type Shared = Arc<Mutex<Core>>;
@@ -127,20 +127,16 @@ impl Core {
         }
         factorio::read_credentials(self.config.factorio_user_dir.as_ref()?)
     }
+    /// Version de Factorio à laquelle les mods doivent correspondre : celle du jeu installé.
+    /// Si le jeu n'est pas détecté : version des paramètres, puis celle du modpack.
     fn target_factorio(&self, pack: Option<&Modpack>) -> String {
-        if self.config.feat_factorio_version {
-            if let Some(v) = pack.and_then(|p| p.factorio_version.clone()).filter(|v| !v.is_empty()) {
-                return v;
-            }
+        if let Some(v) = self.game_version.as_ref().and_then(|v| v.parse::<Version>().ok()) {
+            return v.major_minor();
         }
         if !self.config.target_factorio.is_empty() {
             return self.config.target_factorio.clone();
         }
-        self.game_version
-            .as_ref()
-            .and_then(|v| v.parse::<Version>().ok())
-            .map(|v| v.major_minor())
-            .unwrap_or_default()
+        pack.and_then(|p| p.factorio_version.clone()).unwrap_or_default()
     }
     fn choices(&self) -> BTreeMap<String, String> {
         let mut c = self.state.conflict_choices.clone();
@@ -297,6 +293,7 @@ fn portal_summary<'a>(k: &'a Core, name: &str) -> Option<&'a ModListEntry> {
 fn refresh_library(ui: &AppWindow, k: &Core) {
     let filter = ui.get_library_filter().to_lowercase();
     let mode = ui.get_library_mode();
+    let game = k.game_version.as_ref().and_then(|v| v.parse::<Version>().ok()).map(|v| v.major_minor()).unwrap_or_default();
     let res = k.resolution();
     let mut rows = Vec::new();
     for (name, versions) in &k.index {
@@ -334,6 +331,7 @@ fn refresh_library(ui: &AppWindow, k: &Core) {
             update: update.into(),
             packs: packs.join(", ").into(),
             active,
+            incompatible: !game.is_empty() && !factorio_compatible(&latest.factorio_version, &game),
         });
     }
     rows.sort_by_key(|r| r.title.to_lowercase());
@@ -520,20 +518,17 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
     };
     ui.set_pack_settings_info(info.into());
 
-    let single = State { packs: vec![pack.clone()], active: vec![pack.id.clone()], ..Default::default() };
-    let res = modpack::resolve(&single, &BTreeMap::new());
-    let mut warnings = modpack::check(&res, &k.index, &k.builtins);
-    if k.config.feat_factorio_version && !target.is_empty() {
-        for e in &pack.mods {
-            let ver: Version = e.version.parse().unwrap_or_default();
-            if let Some(i) = store::find(&k.index, &e.name, &ver) {
-                if !i.factorio_version.is_empty() && !same_major_minor(&i.factorio_version, &target) {
-                    warnings.push(format!("{} {} est prévu pour Factorio {}", e.name, e.version, i.factorio_version));
-                }
-            }
-        }
-    }
-    ui.set_pack_warnings(strings(warnings));
+    let issues = modpack::pack_issues(pack, &k.index, &k.builtins, &k.target_factorio(None));
+    ui.set_pack_auto_fixable(issues.iter().filter(|i| i.is_automatic()).count() as i32);
+    let rows: Vec<IssueRow> = issues
+        .into_iter()
+        .map(|i| IssueRow {
+            text: i.text.into(),
+            a: i.disable.first().cloned().unwrap_or_default().into(),
+            b: i.disable.get(1).cloned().unwrap_or_default().into(),
+        })
+        .collect();
+    ui.set_pack_issues(model(rows));
 }
 
 fn refresh_dl(ui: &AppWindow, k: &Core) {
@@ -748,21 +743,15 @@ fn check_updates(c: &Shared) -> Result<String> {
     let (portal, names, target, local) = {
         let k = c.lock().unwrap();
         let names: Vec<String> = k.index.keys().filter(|n| !is_builtin(n, &k.builtins)).cloned().collect();
-        let local: HashMap<String, (Version, String)> = k
-            .index
-            .iter()
-            .map(|(n, v)| (n.clone(), (v[0].version, v[0].factorio_version.clone())))
-            .collect();
+        let local: HashMap<String, Version> = k.index.iter().map(|(n, v)| (n.clone(), v[0].version)).collect();
         (k.portal.clone(), names, k.target_factorio(None), local)
     };
     let releases = portal.releases_for(&names)?;
     let mut updates = BTreeMap::new();
     for (name, rels) in releases {
-        let Some((cur, cur_fv)) = local.get(&name) else { continue };
-        let best = rels
-            .into_iter()
-            .filter(|r| same_major_minor(&r.factorio(), &target) || same_major_minor(&r.factorio(), cur_fv))
-            .max_by_key(|r| r.ver());
+        let Some(cur) = local.get(&name) else { continue };
+        // Seules les versions chargeables par le jeu installé sont proposées.
+        let best = rels.into_iter().filter(|r| factorio_compatible(&r.factorio(), &target)).max_by_key(|r| r.ver());
         if let Some(r) = best.filter(|r| r.ver() > *cur) {
             updates.insert(name, r);
         }
@@ -852,7 +841,7 @@ fn required_closure(
         let to_fetch: Vec<String> = frontier
             .iter()
             .filter(|(d, _)| !is_builtin(&d.name, builtins) && !seen.contains(&d.name))
-            .filter(|(d, _)| !index.get(&d.name).map(|v| v.iter().any(|m| d.matches(&m.version))).unwrap_or(false))
+            .filter(|(d, _)| installed_compatible(index, d, target).is_none())
             .map(|(d, _)| d.name.clone())
             .collect();
         parallel_map(&to_fetch, 8, |n| portal.full(n).ok().map(|_| ()));
@@ -861,7 +850,7 @@ fn required_closure(
             if is_builtin(&dep.name, builtins) || !seen.insert(dep.name.clone()) {
                 continue;
             }
-            let installed = index.get(&dep.name).and_then(|v| v.iter().find(|m| dep.matches(&m.version)));
+            let installed = installed_compatible(index, &dep, target);
             let mut item = DlItem {
                 name: dep.name.clone(),
                 kind: dep.kind,
@@ -888,7 +877,10 @@ fn required_closure(
                         None => {
                             item.checked = false;
                             item.checkable = false;
-                            item.status = format!("⚠ Aucune version compatible sur le portail • requis par {parent}");
+                            item.status = format!(
+                                "⚠ Aucune version pour Factorio {target} (publié pour : {}) • requis par {parent}",
+                                full.published_for()
+                            );
                         }
                     },
                     Err(e) => {
@@ -905,28 +897,69 @@ fn required_closure(
     items
 }
 
+/// Version du dépôt qui satisfait la contrainte ET peut être chargée par le jeu.
+fn installed_compatible<'a>(index: &'a Index, dep: &Dependency, game: &str) -> Option<&'a store::ModInfo> {
+    index
+        .get(&dep.name)?
+        .iter()
+        .find(|m| dep.matches(&m.version) && factorio_compatible(&m.factorio_version, game))
+}
+
 fn build_items(portal: &Portal, index: &Index, builtins: &[String], target: &str, name: &str, rel: &Release) -> Vec<DlItem> {
     let mut seen = HashSet::from([name.to_string()]);
     let deps = rel.deps();
     let mut items = required_closure(portal, index, builtins, target, name, deps.clone(), &mut seen);
-    for dep in deps.iter().filter(|d| d.kind.is_optional_like()) {
-        if is_builtin(&dep.name, builtins) || !seen.insert(dep.name.clone()) {
+    let optional: Vec<&Dependency> = deps
+        .iter()
+        .filter(|d| d.kind.is_optional_like() && !is_builtin(&d.name, builtins) && !seen.contains(&d.name))
+        .collect();
+    let to_fetch: Vec<String> = optional
+        .iter()
+        .filter(|d| installed_compatible(index, d, target).is_none())
+        .map(|d| d.name.clone())
+        .collect();
+    parallel_map(&to_fetch, 8, |n| portal.full(n).ok().map(|_| ()));
+    for dep in optional {
+        if !seen.insert(dep.name.clone()) {
             continue;
         }
-        let installed = index.get(&dep.name).and_then(|v| v.iter().find(|m| dep.matches(&m.version)));
-        items.push(DlItem {
+        let mut item = DlItem {
             name: dep.name.clone(),
             kind: dep.kind,
             constraint: Some(dep.clone()),
             release: None,
-            installed: installed.map(|i| i.version),
+            installed: None,
             checked: false,
             checkable: true,
-            status: match installed {
-                Some(i) => format!("Déjà dans le dépôt ({})", i.version),
-                None => "Sera téléchargé avec ses dépendances obligatoires".into(),
-            },
-        });
+            status: String::new(),
+        };
+        if let Some(i) = installed_compatible(index, dep, target) {
+            item.installed = Some(i.version);
+            item.status = format!("Déjà dans le dépôt ({})", i.version);
+        } else {
+            match portal.full(&dep.name) {
+                Ok(full) => match full.best_release(target, Some(dep)) {
+                    Some(r) => {
+                        item.status = format!(
+                            "À télécharger : {} (Factorio {}), avec ses dépendances obligatoires",
+                            r.version,
+                            r.factorio()
+                        );
+                        item.release = Some(r);
+                    }
+                    None => {
+                        item.checkable = false;
+                        item.status =
+                            format!("Aucune version pour Factorio {target} (publié pour : {})", full.published_for());
+                    }
+                },
+                Err(_) => {
+                    item.checkable = false;
+                    item.status = "Introuvable sur le portail".into();
+                }
+            }
+        }
+        items.push(item);
     }
     // Les mods incompatibles (« ! ») ne sont pas proposés : ce ne sont pas des dépendances à ajouter.
     // Les conflits éventuels restent signalés dans les problèmes détectés du modpack.
@@ -1013,7 +1046,21 @@ fn open_download(ui: &AppWindow, core: &Shared, name: String, preset: Option<Str
                 return;
             }
         };
-        let releases = full.sorted_releases();
+        let releases = full.compatible_releases(&target);
+        if releases.is_empty() {
+            let msg = format!(
+                "Aucune version de « {} » n'est compatible avec Factorio {target} (publié pour : {}).",
+                display_title(&full.title, &full.name),
+                full.published_for()
+            );
+            let _ = w.upgrade_in_event_loop(move |ui| {
+                ui.set_dl_loading(false);
+                ui.set_dl_versions(strings(vec![]));
+                ui.set_dl_deps(model(vec![]));
+                ui.set_dl_info(msg.into());
+            });
+            return;
+        }
         let idx = preset
             .and_then(|v| releases.iter().position(|r| r.version == v))
             .or_else(|| {
@@ -1072,6 +1119,11 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
     let main_installed = store::find(&index, &dl.name, &main.ver()).is_some();
     wanted.push((dl.name.clone(), main.ver(), if main_installed { None } else { Some(main.clone()) }));
     let mut seen: HashSet<String> = HashSet::from([dl.name.clone()]);
+    // Mods sans version compatible avec le jeu installé : non téléchargés, signalés à la fin.
+    let mut skipped: Vec<String> = Vec::new();
+    if !factorio_compatible(&main.factorio(), &target) {
+        bail!("{} {} est prévu pour Factorio {}, pas {target}", dl.name, main.version, main.factorio());
+    }
     for item in dl.items.iter().filter(|i| i.checked && i.kind.is_required()) {
         seen.insert(item.name.clone());
         if let Some(v) = item.installed {
@@ -1088,10 +1140,14 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
             wanted.push((item.name.clone(), v, None));
             continue;
         }
-        let full = portal.full(&item.name)?;
-        let rel = full
-            .best_release(&target, item.constraint.as_ref())
-            .ok_or_else(|| anyhow!("aucune version compatible pour {}", item.name))?;
+        let rel = match &item.release {
+            Some(r) => Some(r.clone()),
+            None => portal.full(&item.name).ok().and_then(|f| f.best_release(&target, item.constraint.as_ref())),
+        };
+        let Some(rel) = rel else {
+            skipped.push(item.name.clone());
+            continue;
+        };
         let extra = required_closure(&portal, &index, &builtins, &target, &item.name, rel.deps(), &mut seen);
         wanted.push((item.name.clone(), rel.ver(), Some(rel)));
         for e in extra {
@@ -1099,6 +1155,8 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
                 wanted.push((e.name, v, None));
             } else if let Some(r) = e.release {
                 wanted.push((e.name, r.ver(), Some(r)));
+            } else {
+                skipped.push(e.name);
             }
         }
     }
@@ -1125,6 +1183,9 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
 
     let mut k = c.lock().unwrap();
     let mut msg = format!("{} mod(s) téléchargé(s)", to_download.len());
+    if !skipped.is_empty() {
+        msg.push_str(&format!(" ({} ignoré(s), sans version pour Factorio {target} : {})", skipped.len(), skipped.join(", ")));
+    }
     let pack_id = if let Some(name) = new_pack {
         let mut p = Modpack::new(&name);
         p.base_mod = Some(dl.name.clone());
@@ -2015,6 +2076,35 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
             (id, e)
         };
         open_download(&ui, &c, entry.name, Some(entry.version), DlTarget::Pack(id), true);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_pack_disable_mod(move |name| {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let Some(id) = k.selected_pack.clone() else { return };
+        if let Some(e) = k.state.pack_mut(&id).and_then(|p| p.mods.iter_mut().find(|e| e.name == name.as_str())) {
+            e.enabled = false;
+        }
+        k.save_state();
+        refresh_all(&ui, &k);
+        ui.set_status(format!("{name} désactivé dans le modpack.").into());
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_pack_auto_fix(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let Some(id) = k.selected_pack.clone() else { return };
+        let (index, builtins, game) = (k.index.clone(), k.builtins.clone(), k.target_factorio(None));
+        let Some(pack) = k.state.pack_mut(&id) else { return };
+        let off = modpack::auto_disable(pack, &index, &builtins, &game);
+        let left = modpack::pack_issues(pack, &index, &builtins, &game).len();
+        k.save_state();
+        refresh_all(&ui, &k);
+        let mut msg = format!("{} mod(s) désactivé(s) : {}.", off.len(), off.join(", "));
+        if left > 0 {
+            msg.push_str(&format!(" {left} incompatibilité(s) restent à arbitrer."));
+        }
+        ui.set_status(msg.into());
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_pack_mod_filter_changed(move || {

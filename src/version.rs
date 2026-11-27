@@ -47,6 +47,20 @@ pub fn same_major_minor(a: &str, b: &str) -> bool {
     }
 }
 
+/// Un mod (champ `factorio_version` de son info.json) peut-il être chargé par cette version du jeu ?
+/// Factorio exige la même version majeure.mineure (un mod 2.0 est refusé par Factorio 2.1) ;
+/// seule exception historique : Factorio 1.0 accepte les mods 0.18.
+/// Une version de jeu inconnue (vide) n'impose aucune contrainte.
+pub fn factorio_compatible(mod_factorio: &str, game: &str) -> bool {
+    if game.trim().is_empty() {
+        return true;
+    }
+    let (Ok(m), Ok(g)) = (mod_factorio.parse::<Version>(), game.parse::<Version>()) else {
+        return false;
+    };
+    (m.0 == g.0 && m.1 == g.1) || (g.0 == 1 && g.1 == 0 && m.0 == 0 && m.1 == 18)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum DepKind {
     Required,
@@ -201,6 +215,18 @@ mod tests {
         assert!(Version(1, 10, 0) > Version(1, 9, 9));
         assert!(same_major_minor("2.0", "2.0.28"));
         assert!(!same_major_minor("2.1", "2.0.28"));
+    }
+
+    #[test]
+    fn factorio_compatibility() {
+        assert!(factorio_compatible("2.1", "2.1.25"));
+        assert!(factorio_compatible("2.1", "2.1"));
+        assert!(!factorio_compatible("2.0", "2.1.25"));
+        assert!(!factorio_compatible("2.1", "2.0.72"));
+        assert!(factorio_compatible("0.18", "1.0.0"));
+        assert!(!factorio_compatible("0.17", "1.0.0"));
+        assert!(!factorio_compatible("", "2.1"));
+        assert!(factorio_compatible("2.0", ""));
     }
 
     #[test]

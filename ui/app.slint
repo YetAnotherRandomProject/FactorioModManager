@@ -12,6 +12,7 @@ export struct ModRow {
     update: string,
     packs: string,
     active: bool,
+    incompatible: bool,
 }
 
 export struct VersionRow {
@@ -87,6 +88,12 @@ export struct AddRow {
     title: string,
     info: string,
     installed: bool,
+}
+
+export struct IssueRow {
+    text: string,
+    a: string,
+    b: string,
 }
 
 export struct ConflictRow {
@@ -239,6 +246,11 @@ component ModCard inherits Rectangle {
                 bg: Theme.warn;
                 fg: black;
             }
+            if root.data.incompatible: Badge {
+                text: "incompatible";
+                bg: #d0453a;
+                fg: white;
+            }
         }
     }
     ta := TouchArea {
@@ -376,7 +388,10 @@ export component AppWindow inherits Window {
     in property <[SaveRow]> pack-saves: [];
     in property <string> pack-settings-info: "";
     in property <bool> pack-has-settings: false;
-    in property <[string]> pack-warnings: [];
+    in property <[IssueRow]> pack-issues: [];
+    in property <int> pack-auto-fixable: 0;
+    callback pack-disable-mod(string);
+    callback pack-auto-fix();
     callback new-pack();
     callback import-pack();
     callback select-pack(string);
@@ -1105,20 +1120,56 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                if root.pack-warnings.length > 0: VerticalLayout {
+                                if root.pack-issues.length > 0: VerticalLayout {
+                                    // Hauteur fixe : la zone ne doit pas s'étirer au détriment de la liste des mods.
+                                    vertical-stretch: 0;
                                     spacing: 4px;
-                                    SectionTitle {
-                                        text: "Problèmes détectés (" + root.pack-warnings.length + ")";
-                                        color: Theme.warn;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        SectionTitle {
+                                            text: "Problèmes détectés (" + root.pack-issues.length + ")";
+                                            color: Theme.warn;
+                                            vertical-alignment: center;
+                                        }
+                                        if root.pack-auto-fixable > 0: ActionButton {
+                                            width: 300px;
+                                            text: "Désactiver automatiquement (" + root.pack-auto-fixable + ")";
+                                            clicked => {
+                                                root.pack-auto-fix();
+                                            }
+                                        }
                                     }
                                     ListView {
-                                        height: min(96px, root.pack-warnings.length * 18px);
-                                        for w in root.pack-warnings: Text {
-                                            height: 18px;
-                                            text: "• " + w;
-                                            color: Theme.warn;
-                                            overflow: elide;
-                                            font-size: 12px;
+                                        vertical-stretch: 0;
+                                        height: min(4, root.pack-issues.length) * 36px;
+                                        for w in root.pack-issues: HorizontalLayout {
+                                            height: 36px;
+                                            spacing: 6px;
+                                            Text {
+                                                text: "• " + w.text;
+                                                color: Theme.warn;
+                                                overflow: elide;
+                                                font-size: 12px;
+                                                vertical-alignment: center;
+                                            }
+                                            Button {
+                                                width: 200px;
+                                                height: 30px;
+                                                y: 3px;
+                                                text: "Désactiver " + w.a;
+                                                clicked => {
+                                                    root.pack-disable-mod(w.a);
+                                                }
+                                            }
+                                            if w.b != "": Button {
+                                                width: 200px;
+                                                height: 30px;
+                                                y: 3px;
+                                                text: "Désactiver " + w.b;
+                                                clicked => {
+                                                    root.pack-disable-mod(w.b);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1397,7 +1448,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: "Version de Factorio ciblée pour les téléchargements (vide = version installée)";
+                                    text: "Version de Factorio à utiliser si le jeu n'est pas détecté (sinon, la version installée fait foi)";
                                     color: Theme.muted;
                                 }
                                 LineEdit {

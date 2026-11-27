@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::version::{Dependency, Version, same_major_minor};
+use crate::version::{Dependency, Version, factorio_compatible, same_major_minor};
 
 const API: &str = "https://mods.factorio.com";
 const ASSETS: &str = "https://assets-mod.factorio.com";
@@ -108,14 +108,25 @@ impl ModFull {
         r
     }
 
-    /// Meilleure release pour une version de Factorio et une contrainte éventuelle.
-    pub fn best_release(&self, target_factorio: &str, dep: Option<&Dependency>) -> Option<Release> {
-        let rel = self.sorted_releases();
-        let ok_dep = |r: &Release| dep.map(|d| d.matches(&r.ver())).unwrap_or(true);
-        rel.iter()
-            .find(|r| ok_dep(r) && (target_factorio.is_empty() || same_major_minor(&r.factorio(), target_factorio)))
-            .or_else(|| rel.iter().find(|r| ok_dep(r)))
-            .cloned()
+    /// Releases chargeables par cette version du jeu, de la plus récente à la plus ancienne.
+    pub fn compatible_releases(&self, game: &str) -> Vec<Release> {
+        self.sorted_releases().into_iter().filter(|r| factorio_compatible(&r.factorio(), game)).collect()
+    }
+
+    /// Meilleure release compatible avec la version du jeu et la contrainte éventuelle.
+    /// Aucune release incompatible n'est proposée en repli.
+    pub fn best_release(&self, game: &str, dep: Option<&Dependency>) -> Option<Release> {
+        self.compatible_releases(game)
+            .into_iter()
+            .find(|r| dep.map(|d| d.matches(&r.ver())).unwrap_or(true))
+    }
+
+    /// Versions de Factorio pour lesquelles le mod est publié (pour les messages d'erreur).
+    pub fn published_for(&self) -> String {
+        let mut v: Vec<String> = self.releases.iter().map(|r| r.factorio()).filter(|f| !f.is_empty()).collect();
+        v.sort_by_key(|f| std::cmp::Reverse(f.parse::<Version>().unwrap_or_default()));
+        v.dedup();
+        v.join(", ")
     }
 }
 
