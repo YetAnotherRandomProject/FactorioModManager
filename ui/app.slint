@@ -1,4 +1,4 @@
-import { Button, LineEdit, CheckBox, ComboBox, ListView, ScrollView, Palette, Switch, ProgressIndicator, GroupBox, Spinner } from "std-widgets.slint";
+import { Button, LineEdit, TextEdit, CheckBox, ComboBox, ListView, ScrollView, Palette, Switch, ProgressIndicator, GroupBox, Spinner } from "std-widgets.slint";
 
 export struct ModRow {
     name: string,
@@ -101,6 +101,14 @@ export struct IssueRow {
     b: string,
 }
 
+export struct FailRow {
+    name: string,
+    title: string,
+    enabled: bool,
+    effect: string,
+    effect-warn: bool,
+}
+
 export struct ConflictRow {
     name: string,
     labels: [string],
@@ -157,6 +165,35 @@ component Badge inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
         overflow: elide;
+    }
+}
+
+// Petit bouton carré avec une croix dessinée (la police n'a pas de glyphe « ✕ »).
+component IconButton inherits Rectangle {
+    in property <string> tooltip;
+    callback clicked;
+    width: 24px;
+    height: 24px;
+    border-radius: 4px;
+    background: ta.pressed ? Palette.control-background.darker(0.2) : ta.has-hover ? Palette.control-background : transparent;
+    border-width: 1px;
+    border-color: Palette.border;
+    Path {
+        x: 7px;
+        y: 7px;
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        stroke: Palette.foreground;
+        stroke-width: 1.6px;
+        commands: "M 0 0 L 10 10 M 10 0 L 0 10";
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
     }
 }
 
@@ -327,6 +364,27 @@ export component AppWindow inherits Window {
     callback sync-now();
     callback launch-game();
 
+    // ---------- Vérification du chargement des mods ----------
+    in property <bool> check-running: false;
+    in property <float> check-progress: 0;
+    in property <string> check-label: "";
+    in property <bool> check-ok: false;
+    in property <bool> has-failure: false;
+    in-out property <bool> fail-visible: false;
+    in property <string> fail-title;
+    in property <string> fail-text;
+    in property <string> fail-note;
+    in property <bool> fail-can-bisect: false;
+    in property <[FailRow]> fail-rows: [];
+    callback fail-disable(string);
+    callback fail-bisect();
+    callback fail-launch();
+    callback fail-launch-anyway();
+    callback fail-close();
+    callback show-failure();
+    callback cancel-check();
+    callback check-now();
+
     // ---------- Bibliothèque ----------
     in property <[ModRow]> library: [];
     in property <int> library-total: 0;
@@ -487,6 +545,8 @@ export component AppWindow inherits Window {
     in-out property <bool> s-copy-back;
     in-out property <string> s-interval;
     in-out property <bool> s-auto-app;
+    in-out property <bool> s-check-launch;
+    in-out property <bool> s-sprite-cache;
     in property <string> app-version;
     in property <string> app-update: "";
     callback install-app-update();
@@ -553,6 +613,51 @@ export component AppWindow inherits Window {
                     wrap: word-wrap;
                     color: Theme.muted;
                     font-size: 12px;
+                }
+                if root.check-running: VerticalLayout {
+                    spacing: 3px;
+                    HorizontalLayout {
+                        spacing: 4px;
+                        Text {
+                            text: "Vérification des mods " + Math.round(root.check-progress * 100) + " %";
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        IconButton {
+                            tooltip: "Annuler la vérification";
+                            clicked => {
+                                root.cancel-check();
+                            }
+                        }
+                    }
+                    ProgressIndicator {
+                        height: 6px;
+                        progress: root.check-progress;
+                    }
+                    Text {
+                        text: root.check-label;
+                        color: Theme.muted;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+                }
+                if !root.check-running && root.has-failure: Button {
+                    text: "⚠  Erreur de chargement";
+                    clicked => {
+                        root.show-failure();
+                    }
+                }
+                if !root.check-running && !root.has-failure && root.check-ok: Text {
+                    text: "✓ Mods vérifiés : lancement direct";
+                    color: Theme.ok;
+                    font-size: 12px;
+                }
+                if !root.check-running: Button {
+                    text: "Vérifier les mods actifs";
+                    clicked => {
+                        root.check-now();
+                    }
                 }
                 Button {
                     text: "Synchroniser vers Factorio";
@@ -1655,6 +1760,20 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                        GroupBox {
+                            title: "Lancement";
+                            VerticalLayout {
+                                spacing: 4px;
+                                CheckBox {
+                                    text: "Vérifier le chargement des mods avant de lancer le jeu (sans charger les sprites)";
+                                    checked <=> root.s-check-launch;
+                                }
+                                CheckBox {
+                                    text: "Cache de l'atlas des sprites (--cache-sprite-atlas) : lancements suivants plus rapides, plus d'espace disque";
+                                    checked <=> root.s-sprite-cache;
+                                }
+                            }
+                        }
                         HorizontalLayout {
                             spacing: 8px;
                             alignment: start;
@@ -1929,6 +2048,112 @@ export component AppWindow inherits Window {
                 primary: true;
                 clicked => {
                     root.conflict-confirm();
+                }
+            }
+        }
+    }
+
+    // ---------- Erreur de chargement ----------
+    if root.fail-visible: Overlay {
+        dialog-width: 780px;
+        dialog-height: 620px;
+        Text {
+            text: root.fail-title;
+            font-size: 18px;
+            font-weight: 700;
+            color: #d0453a;
+        }
+        Text {
+            text: "Message de Factorio :";
+            color: Theme.muted;
+            font-size: 12px;
+        }
+        // Zone en lecture seule : le texte se sélectionne et se copie (Ctrl+C ou bouton « Copier »).
+        fail-text-edit := TextEdit {
+            vertical-stretch: 1;
+            read-only: true;
+            wrap: word-wrap;
+            font-size: 12px;
+            text: root.fail-text;
+        }
+        if root.fail-note != "": Text {
+            text: root.fail-note;
+            wrap: word-wrap;
+            font-weight: 600;
+        }
+        if root.fail-rows.length > 0: Text {
+            text: "Mods en cause :";
+            font-weight: 700;
+        }
+        for r in root.fail-rows: HorizontalLayout {
+            height: 40px;
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                Text {
+                    text: r.title + (r.title != r.name ? "  (" + r.name + ")" : "");
+                    overflow: elide;
+                    color: r.enabled ? Palette.foreground : Theme.muted;
+                }
+                if r.effect != "": Text {
+                    text: r.effect;
+                    font-size: 11px;
+                    overflow: elide;
+                    color: r.effect-warn ? Theme.warn : Theme.muted;
+                }
+            }
+            if r.enabled: Button {
+                text: "Désactiver";
+                width: 130px;
+                clicked => {
+                    root.fail-disable(r.name);
+                }
+            }
+            if !r.enabled: Text {
+                text: "désactivé";
+                width: 130px;
+                color: Theme.muted;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            ActionButton {
+                text: "Copier le message";
+                clicked => {
+                    fail-text-edit.select-all();
+                    fail-text-edit.copy();
+                    fail-text-edit.clear-selection();
+                }
+            }
+            if root.fail-can-bisect: ActionButton {
+                text: "Chercher le mod en conflit";
+                clicked => {
+                    root.fail-bisect();
+                }
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            ActionButton {
+                text: "Fermer";
+                clicked => {
+                    root.fail-close();
+                }
+            }
+            ActionButton {
+                text: "Lancer quand même";
+                clicked => {
+                    root.fail-launch-anyway();
+                }
+            }
+            ActionButton {
+                text: "Revérifier et lancer";
+                primary: true;
+                clicked => {
+                    root.fail-launch();
                 }
             }
         }

@@ -6,12 +6,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::check::{self, CheckDirs};
 use crate::config::{Config, Paths};
 use crate::factorio::{self, ModList};
+use crate::instance;
 use crate::modpack::{self, Conflict, Modpack, PackEntry, Resolution, State};
 use crate::portal::{self, ModListEntry, Portal, Release};
 use crate::store::{self, AddMode, Index, Store};
@@ -20,7 +22,7 @@ use crate::transfer;
 use crate::updater::{self, AppRelease};
 use crate::version::{DepKind, Dependency, Version, factorio_compatible, is_builtin, same_major_minor};
 use crate::{
-    AddRow, AppWindow, IssueRow, BuiltinRow, ConflictRow, DepRow, ModRow, PackModRow, PackRow, SaveRow, SearchRow, VersionRow,
+    AddRow, AppWindow, FailRow, IssueRow, BuiltinRow, ConflictRow, DepRow, ModRow, PackModRow, PackRow, SaveRow, SearchRow, VersionRow,
 };
 
 type Shared = Arc<Mutex<Core>>;
@@ -82,6 +84,30 @@ enum Confirm {
     BulkDelete(Vec<String>),
 }
 
+/// Vérification du chargement des mods en cours (instance isolée de Factorio).
+struct CheckRun {
+    id: u64,
+    fp: String,
+    cancel: Arc<AtomicBool>,
+    /// Lancement demandé une fois la vérification réussie (avec la sauvegarde éventuelle).
+    launch_after: Option<Option<PathBuf>>,
+    bisecting: bool,
+    /// Demandée par l'utilisateur : la fenêtre d'erreur s'ouvre en cas d'échec.
+    manual: bool,
+}
+
+/// Dernière erreur de chargement ou d'exécution relevée.
+#[derive(Clone)]
+struct LastFailure {
+    fp: String,
+    failure: check::Failure,
+    /// Erreur survenue en partie : le chargement, lui, a fonctionné.
+    runtime: bool,
+    /// Conclusion de la recherche du mod en conflit.
+    note: String,
+    save: Option<PathBuf>,
+}
+
 /// Mod en cours de téléchargement, affiché grisé avec sa progression dans les listes.
 #[derive(Clone, Debug)]
 struct Pending {
@@ -119,6 +145,13 @@ pub struct Core {
     lib_selection: BTreeSet<String>,
     /// Téléchargements en cours, par nom de mod.
     pending: BTreeMap<String, Pending>,
+    check_dirs: CheckDirs,
+    check: Option<CheckRun>,
+    check_gen: u64,
+    failure: Option<LastFailure>,
+    game_running: bool,
+    /// Fichiers introuvables relevés par la dernière vérification de chaque ensemble.
+    pending_missing: HashMap<String, BTreeSet<String>>,
 }
 
 impl Core {
@@ -172,6 +205,20 @@ impl Core {
             .iter()
             .map(|id| (id.clone(), self.paths.pack_settings(id)))
             .find(|(_, p)| p.exists())
+    }
+    /// Réglages des mods utilisés au lancement : ceux du modpack, sinon ceux restés dans le profil.
+    fn effective_settings(&self) -> Option<PathBuf> {
+        self.settings_source()
+            .map(|(_, p)| p)
+            .or_else(|| Some(self.paths.profile.join("mod-settings.dat")))
+            .filter(|p| p.exists())
+    }
+    fn launch_fingerprint(&self, res: &Resolution) -> String {
+        check::fingerprint(res, self.game_version.as_deref().unwrap_or(""), self.effective_settings().as_deref())
+    }
+    /// Mods pouvant être mis en cause (hors jeu de base et DLC) et leurs titres.
+    fn known_and_titles(&self, res: &Resolution) -> (BTreeSet<String>, BTreeMap<String, String>) {
+        (res.mods.keys().cloned().collect(), check::titles(&self.index, res))
     }
     fn refresh_factorio(&mut self) {
         let exe = self.config.factorio_exe.clone();
@@ -564,7 +611,7 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
     };
     ui.set_pack_settings_info(info.into());
 
-    let issues = modpack::pack_issues(pack, &k.index, &k.builtins, &k.target_factorio(None));
+    let issues = modpack::pack_issues(pack, &k.index, &k.builtins, &k.target_factorio(None), &k.state.found_incompatibilities);
     ui.set_pack_auto_fixable(issues.iter().filter(|i| i.is_automatic()).count() as i32);
     let rows: Vec<IssueRow> = issues
         .into_iter()
@@ -638,6 +685,8 @@ fn refresh_settings(ui: &AppWindow, k: &Core) {
     ui.set_s_copy_back(c.copy_back_settings);
     ui.set_s_interval(c.check_interval_minutes.to_string().into());
     ui.set_s_auto_app(c.auto_update_app);
+    ui.set_s_check_launch(c.check_before_launch);
+    ui.set_s_sprite_cache(c.cache_sprite_atlas);
     ui.set_app_version(format!("v{}", env!("CARGO_PKG_VERSION")).into());
     ui.set_s_data_dir(k.paths.data.display().to_string().into());
     let detected = match &k.game_version {
@@ -1490,26 +1539,386 @@ fn start_sync(ui: &AppWindow, core: &Shared) {
     k.confirm = Some(Confirm::Sync(plan, settings));
 }
 
+/// Lancement demandé : vérifie d'abord le chargement des mods (sauf si cet ensemble a déjà réussi).
 fn start_launch(ui: &AppWindow, core: &Shared, save: Option<PathBuf>) {
+    let mut k = core.lock().unwrap();
+    if !k.config.check_before_launch || k.config.factorio_exe.is_none() {
+        drop(k);
+        return do_launch(ui, core, save, None);
+    }
+    let res = k.resolution();
+    let fp = k.launch_fingerprint(&res);
+    if k.check_dirs.is_known_ok(&fp) {
+        drop(k);
+        return do_launch(ui, core, save, Some(fp));
+    }
+    if let Some(f) = k.failure.as_mut().filter(|f| f.fp == fp && !f.runtime) {
+        f.save = save;
+        refresh_failure(ui, &k);
+        ui.set_fail_visible(true);
+        return;
+    }
+    if let Some(run) = k.check.as_mut() {
+        if run.fp == fp && !run.bisecting {
+            run.launch_after = Some(save);
+            ui.set_status("Vérification des mods en cours : le jeu sera lancé dès qu'elle aura réussi.".into());
+            return;
+        }
+        run.cancel.store(true, Ordering::SeqCst);
+        k.check = None;
+    }
+    drop(k);
+    start_check(ui, core, Some(save), true);
+}
+
+fn post_check_progress(w: &Weak<AppWindow>, p: f32, label: String) {
+    let _ = w.upgrade_in_event_loop(move |ui| {
+        ui.set_check_progress(p);
+        ui.set_check_label(label.into());
+    });
+}
+
+fn enabled_count(res: &Resolution, builtins: &[String]) -> usize {
+    res.mods.len() + builtins.iter().filter(|b| !res.disabled_builtins.contains(*b)).count()
+}
+
+/// Vérifie l'ensemble de mods actif dans l'instance isolée. `launch_after` : lancer ensuite si OK.
+fn start_check(ui: &AppWindow, core: &Shared, launch_after: Option<Option<PathBuf>>, manual: bool) {
+    let mut k = core.lock().unwrap();
+    let Some(exe) = k.config.factorio_exe.clone() else { return };
+    let res = k.resolution();
+    let fp = k.launch_fingerprint(&res);
+    let settings = k.effective_settings();
+    let (known, titles) = k.known_and_titles(&res);
+    k.check_gen += 1;
+    let id = k.check_gen;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let manual = manual || launch_after.is_some();
+    k.check = Some(CheckRun { id, fp, cancel: cancel.clone(), launch_after, bisecting: false, manual });
+    let (index, builtins, dirs) = (k.index.clone(), k.builtins.clone(), k.check_dirs.clone());
+    drop(k);
+    ui.set_check_running(true);
+    ui.set_check_progress(0.0);
+    ui.set_check_label("Préparation…".into());
+    if manual {
+        ui.set_status("Vérification du chargement des mods (sans les sprites)…".into());
+    }
+    let (c, w) = (core.clone(), ui.as_weak());
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let outcome = (|| -> Result<Option<check::Outcome>> {
+            dirs.prepare()?;
+            sync::build_profile(&dirs.mods(), &res, &index, &builtins, settings.as_deref())?;
+            if settings.is_none() {
+                let _ = fs::remove_file(dirs.mods().join("mod-settings.dat"));
+            }
+            let out = check::run(&exe, &dirs, enabled_count(&res, &builtins), &known, &titles, &cancel, |p, label| {
+                post_check_progress(&w, p, label.to_string())
+            })?;
+            Ok(out.map(|o| check::judge(&dirs, &known, o)))
+        })();
+        let secs = started.elapsed().as_secs();
+        let _ = w.upgrade_in_event_loop(move |ui| finish_check(&ui, &c, id, outcome, secs));
+    });
+}
+
+fn finish_check(ui: &AppWindow, core: &Shared, id: u64, outcome: Result<Option<check::Outcome>>, secs: u64) {
+    let mut k = core.lock().unwrap();
+    if k.check.as_ref().map(|r| r.id) != Some(id) {
+        return;
+    }
+    let run = k.check.take().unwrap();
+    ui.set_check_running(false);
+    match outcome {
+        Ok(None) => {}
+        Ok(Some(check::Outcome::Ok(missing))) => {
+            k.check_dirs.remember_ok(&run.fp);
+            // Confirmés comme sans conséquence si le vrai jeu se charge avec cet ensemble.
+            k.pending_missing.insert(run.fp.clone(), check::missing_paths(&missing));
+            if k.failure.as_ref().is_some_and(|f| !f.runtime) {
+                k.failure = None;
+            }
+            refresh_check(ui, &mut k);
+            if let Some(save) = run.launch_after {
+                drop(k);
+                do_launch(ui, core, save, Some(run.fp));
+            } else {
+                ui.set_status(format!("Mods vérifiés en {secs} s : aucun problème, le prochain lancement sera direct.").into());
+            }
+        }
+        Ok(Some(check::Outcome::Failed(failure))) => {
+            let launch = run.launch_after.is_some();
+            k.failure = Some(LastFailure {
+                fp: run.fp,
+                failure,
+                runtime: false,
+                note: String::new(),
+                save: run.launch_after.flatten(),
+            });
+            refresh_failure(ui, &k);
+            refresh_check(ui, &mut k);
+            if launch || run.manual {
+                ui.set_fail_visible(true);
+                ui.set_status(format!("Lancement annulé : le chargement des mods échoue (détecté en {secs} s).").into());
+            } else {
+                ui.set_status(
+                    format!("⚠ Le chargement des mods échoue (détecté en {secs} s) : voir « Erreur de chargement ».").into(),
+                );
+            }
+        }
+        Err(e) => {
+            ui.set_status(format!("Vérification impossible : {e:#}").into());
+            if let Some(save) = run.launch_after {
+                drop(k);
+                do_launch(ui, core, save, None);
+            }
+        }
+    }
+}
+
+/// Recherche par dichotomie du mod qui fait échouer le premier mod cité dans l'erreur.
+fn start_bisect(ui: &AppWindow, core: &Shared) {
+    let mut k = core.lock().unwrap();
+    let Some(f) = k.failure.clone() else { return };
+    let Some(culprit) = f.failure.culprits.first().cloned() else { return };
+    let Some(exe) = k.config.factorio_exe.clone() else { return };
+    let res = k.resolution();
+    if k.launch_fingerprint(&res) != f.fp {
+        ui.set_status("La liste de mods a changé depuis l'erreur : relance d'abord la vérification.".into());
+        return;
+    }
+    if let Some(run) = k.check.take() {
+        run.cancel.store(true, Ordering::SeqCst);
+    }
+    k.check_gen += 1;
+    let id = k.check_gen;
+    let cancel = Arc::new(AtomicBool::new(false));
+    k.check = Some(CheckRun { id, fp: f.fp.clone(), cancel: cancel.clone(), launch_after: None, bisecting: true, manual: true });
+    let settings = k.effective_settings();
+    let (known, titles) = k.known_and_titles(&res);
+    let (index, builtins, dirs) = (k.index.clone(), k.builtins.clone(), k.check_dirs.clone());
+    drop(k);
+    ui.set_fail_visible(false);
+    ui.set_check_running(true);
+    ui.set_check_progress(0.0);
+    ui.set_check_label("Recherche du conflit…".into());
+    ui.set_status(format!("Recherche du mod en conflit avec {culprit} (plusieurs vérifications successives)…").into());
+    let (c, w) = (core.clone(), ui.as_weak());
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let result = check::bisect(&culprit, &res, &index, &builtins, |set, step, planned| {
+            let sub = check::subset(&res, set);
+            dirs.prepare()?;
+            sync::build_profile(&dirs.mods(), &sub, &index, &builtins, settings.as_deref())?;
+            let prefix = format!("Essai {step}/~{planned} ({} mods)", sub.mods.len());
+            post_check_progress(&w, 0.0, prefix.clone());
+            let out = check::run(&exe, &dirs, enabled_count(&sub, &builtins), &known, &titles, &cancel, |p, label| {
+                post_check_progress(&w, p, format!("{prefix} — {label}"))
+            })?;
+            Ok(out.map(|o| match check::judge(&dirs, &known, o) {
+                check::Outcome::Ok(_) => false,
+                check::Outcome::Failed(g) => g.culprits.contains(&culprit),
+            }))
+        });
+        let secs = started.elapsed().as_secs();
+        let _ = w.upgrade_in_event_loop(move |ui| {
+            let mut k = c.lock().unwrap();
+            if k.check.as_ref().map(|r| r.id) != Some(id) {
+                return;
+            }
+            k.check = None;
+            ui.set_check_running(false);
+            let note = match result {
+                Ok(None) => return,
+                Ok(Some(check::Bisect::Partner(p))) => {
+                    let known = k
+                        .state
+                        .found_incompatibilities
+                        .iter()
+                        .any(|(a, b)| (a == &culprit && b == &p) || (a == &p && b == &culprit));
+                    if !known {
+                        k.state.found_incompatibilities.push((culprit.clone(), p.clone()));
+                        k.save_state();
+                    }
+                    if let Some(f) = k.failure.as_mut() {
+                        f.failure.culprits = vec![culprit.clone(), p.clone()];
+                    }
+                    format!(
+                        "Trouvé en {secs} s : {culprit} est incompatible avec {p}. L'erreur se reproduit avec ces deux mods \
+                         seuls (et leurs dépendances). Incompatibilité mémorisée : elle apparaît dans les problèmes du modpack."
+                    )
+                }
+                Ok(Some(check::Bisect::Alone)) => format!(
+                    "{culprit} échoue même sans les autres mods : le problème vient de ce mod (ou de sa version), pas d'un conflit."
+                ),
+                Ok(Some(check::Bisect::Unknown)) => {
+                    "Impossible d'isoler un mod partenaire : l'erreur dépend sans doute de plusieurs mods à la fois.".to_string()
+                }
+                Err(e) => format!("Recherche interrompue : {e:#}"),
+            };
+            if let Some(f) = k.failure.as_mut() {
+                f.note = note.clone();
+            }
+            refresh_failure(&ui, &k);
+            refresh_all(&ui, &k);
+            ui.set_fail_visible(true);
+            ui.set_status(note.into());
+        });
+    });
+}
+
+/// Mods chargés qui ne pourraient plus l'être sans `name` : ceux qui en dépendent
+/// obligatoirement, en cascade.
+fn dependents(k: &Core, res: &Resolution, name: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    let mut stack = vec![name.to_string()];
+    while let Some(n) = stack.pop() {
+        for (m, v) in &res.mods {
+            if m == name || out.contains(m) {
+                continue;
+            }
+            let Some(info) = store::find(&k.index, m, v) else { continue };
+            if info.deps().iter().any(|d| d.kind.is_required() && d.name == n) {
+                out.insert(m.clone());
+                stack.push(m.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Désactive un mod, et ceux qui en dépendent obligatoirement, dans tous les modpacks actifs.
+/// Renvoie les mods désactivés.
+fn disable_everywhere(k: &mut Core, name: &str) -> Vec<String> {
+    let res = k.resolution();
+    let mut names = vec![name.to_string()];
+    names.extend(dependents(k, &res, name));
+    let active = k.state.active.clone();
+    for id in active {
+        if let Some(p) = k.state.pack_mut(&id) {
+            for e in p.mods.iter_mut().filter(|e| e.enabled && names.contains(&e.name)) {
+                e.enabled = false;
+            }
+        }
+    }
+    k.save_state();
+    names
+}
+
+/// Conséquence affichée à côté du bouton « Désactiver » (et si elle mérite un avertissement).
+fn disable_effect(k: &Core, res: &Resolution, name: &str) -> (String, bool) {
+    let deps = dependents(k, res, name);
+    match deps.len() {
+        0 => ("Aucun autre mod n'en dépend.".to_string(), false),
+        n => {
+            let shown: Vec<&str> = deps.iter().take(6).map(String::as_str).collect();
+            let more = if n > 6 { format!(" et {} autre(s)", n - 6) } else { String::new() };
+            (format!("Désactivera aussi {n} mod(s) qui en dépendent : {}{more}.", shown.join(", ")), true)
+        }
+    }
+}
+
+fn refresh_failure(ui: &AppWindow, k: &Core) {
+    let Some(f) = &k.failure else {
+        ui.set_fail_visible(false);
+        return;
+    };
+    let res = k.resolution();
+    let rows: Vec<FailRow> = f
+        .failure
+        .culprits
+        .iter()
+        .take(8)
+        .map(|name| {
+            let title = res
+                .mods
+                .get(name)
+                .and_then(|v| store::find(&k.index, name, v))
+                .map(|i| display_title(&i.title, name))
+                .unwrap_or_else(|| name.clone());
+            let enabled = res.mods.contains_key(name);
+            let (effect, effect_warn) = if enabled { disable_effect(k, &res, name) } else { (String::new(), false) };
+            FailRow { name: name.clone().into(), title: title.into(), enabled, effect: effect.into(), effect_warn }
+        })
+        .collect();
+    ui.set_fail_title(
+        if f.runtime { "Factorio a signalé une erreur pendant la partie" } else { "Le chargement des mods échoue" }.into(),
+    );
+    ui.set_fail_text(f.failure.text.clone().into());
+    ui.set_fail_note(f.note.clone().into());
+    ui.set_fail_can_bisect(!f.runtime && !f.failure.culprits.is_empty() && f.note.is_empty());
+    ui.set_fail_rows(model(rows));
+}
+
+/// Indicateurs de la barre latérale : mods déjà vérifiés, erreur en attente.
+fn refresh_check(ui: &AppWindow, k: &mut Core) {
+    let res = k.resolution();
+    let fp = k.launch_fingerprint(&res);
+    ui.set_check_ok(k.config.check_before_launch && k.check_dirs.is_known_ok(&fp));
+    let failed = k.failure.as_ref().is_some_and(|f| f.runtime || f.fp == fp);
+    if !failed && k.failure.is_some() && !ui.get_fail_visible() {
+        // La liste a changé : l'ancienne erreur ne s'applique plus.
+        k.failure = None;
+    }
+    ui.set_has_failure(failed);
+}
+
+/// Minuteur : met à jour les indicateurs de la barre latérale. Aucune vérification n'est
+/// lancée d'elle-même : seulement via « Vérifier les mods actifs » ou au lancement du jeu.
+fn status_tick(ui: &AppWindow, core: &Shared) {
+    let mut k = core.lock().unwrap();
+    refresh_check(ui, &mut k);
+}
+
+/// Lance réellement le jeu, puis analyse son log à la fermeture.
+fn do_launch(ui: &AppWindow, core: &Shared, save: Option<PathBuf>, fp: Option<String>) {
+    {
+        let mut k = core.lock().unwrap();
+        // Une vérification en arrière-plan ne doit pas concurrencer le jeu.
+        if let Some(run) = k.check.take() {
+            run.cancel.store(true, Ordering::SeqCst);
+            ui.set_check_running(false);
+        }
+        k.game_running = true;
+    }
+    ui.set_fail_visible(false);
     task(ui, core, "Préparation du profil de lancement…", move |c, w| {
-        let (exe, profile, res, index, builtins, settings, copy_back, single) = {
+        let (exe, profile, res, index, builtins, settings, copy_back, single, user_dir, sprite_cache, known, titles, fp) = {
             let k = c.lock().unwrap();
             let exe = k.config.factorio_exe.clone().ok_or_else(|| anyhow!("exécutable de Factorio non configuré"))?;
             let settings = k.settings_source();
             let single = if k.state.active.len() == 1 { k.state.active.first().cloned() } else { None };
+            let res = k.resolution();
+            let (known, titles) = k.known_and_titles(&res);
+            let fp = fp.unwrap_or_else(|| k.launch_fingerprint(&res));
             (
                 exe,
                 k.paths.profile.clone(),
-                k.resolution(),
+                res,
                 k.index.clone(),
                 k.builtins.clone(),
                 settings,
                 k.config.copy_back_settings && k.config.feat_mod_settings,
                 single,
+                k.config.factorio_user_dir.clone(),
+                k.config.cache_sprite_atlas,
+                known,
+                titles,
+                fp,
             )
         };
-        let missing = sync::build_profile(&profile, &res, &index, &builtins, settings.as_ref().map(|(_, p)| p.as_path()))?;
-        let mut child = factorio::launch(&exe, Some(&profile), save.as_deref())?;
+        let result = (|| -> Result<(std::process::Child, Vec<String>)> {
+            let missing = sync::build_profile(&profile, &res, &index, &builtins, settings.as_ref().map(|(_, p)| p.as_path()))?;
+            let extra: &[&str] = if sprite_cache { &["--cache-sprite-atlas"] } else { &[] };
+            Ok((factorio::launch(&exe, Some(&profile), save.as_deref(), extra)?, missing))
+        })();
+        let (mut child, missing) = match result {
+            Ok(r) => r,
+            Err(e) => {
+                c.lock().unwrap().game_running = false;
+                return Err(e);
+            }
+        };
         let mut msg = format!("Factorio lancé avec {} mod(s).", res.mods.len());
         if !missing.is_empty() {
             msg.push_str(&format!(" Absents du dépôt : {}", missing.join(", ")));
@@ -1520,6 +1929,40 @@ fn start_launch(ui: &AppWindow, core: &Shared, save: Option<PathBuf>) {
         let w2 = w.clone();
         std::thread::spawn(move || {
             let _ = child.wait();
+            // Analyse du log de la partie : erreur de chargement ou erreur d'un mod en jeu.
+            let log = user_dir
+                .as_ref()
+                .and_then(|d| fs::read_to_string(d.join("factorio-current.log")).ok())
+                .unwrap_or_default();
+            let inited = check::reached_init(&log);
+            let failure = check::parse_log(&log, &known, &titles);
+            let load_failed = failure.as_ref().is_some_and(|f| !f.runtime);
+            {
+                let mut k = c2.lock().unwrap();
+                k.game_running = false;
+                if load_failed {
+                    // La vérification n'avait pas vu cette erreur : on ne garde ni la validation
+                    // ni les fichiers introuvables que le jeu vient de refuser.
+                    k.check_dirs.forget_ok(&fp);
+                    k.check_dirs.remove_tolerated(&check::atlas_missing(&log));
+                } else if inited {
+                    k.check_dirs.remember_ok(&fp);
+                    if let Some(missing) = k.pending_missing.remove(&fp) {
+                        k.check_dirs.add_tolerated(&missing);
+                    }
+                }
+            }
+            if let Some(failure) = failure {
+                let c3 = c2.clone();
+                let _ = w2.upgrade_in_event_loop(move |ui| {
+                    let mut k = c3.lock().unwrap();
+                    let runtime = failure.runtime;
+                    k.failure = Some(LastFailure { fp, failure, runtime, note: String::new(), save: None });
+                    refresh_failure(&ui, &k);
+                    refresh_check(&ui, &mut k);
+                    ui.set_fail_visible(true);
+                });
+            }
             if !copy_back {
                 return;
             }
@@ -1570,6 +2013,18 @@ fn toggle_pack(ui: &AppWindow, core: &Shared, id: &str, on: bool) {
 
 pub fn run() -> Result<()> {
     let paths = Paths::new()?;
+    let _instance = match instance::acquire(&paths.data)? {
+        instance::Instance::Primary(file) => file,
+        instance::Instance::Activated => return Ok(()),
+        instance::Instance::Running => {
+            rfd::MessageDialog::new()
+                .set_title("Factorio Mod Manager")
+                .set_description("Le gestionnaire est déjà ouvert : utilise la fenêtre existante (barre des tâches).")
+                .set_level(rfd::MessageLevel::Info)
+                .show();
+            return Ok(());
+        }
+    };
     let mut config = Config::load(&paths.data.join("config.json"));
     if config.factorio_user_dir.is_none() {
         config.factorio_user_dir = factorio::default_user_dir().filter(|d| d.exists());
@@ -1607,7 +2062,14 @@ pub fn run() -> Result<()> {
         confirm: None,
         lib_selection: BTreeSet::new(),
         pending: BTreeMap::new(),
+        check_dirs: CheckDirs::new(PathBuf::new()),
+        check: None,
+        check_gen: 0,
+        failure: None,
+        game_running: false,
+        pending_missing: HashMap::new(),
     };
+    core.check_dirs = CheckDirs::new(core.paths.data.join("check"));
     core.refresh_factorio();
     core.selected_pack = core.state.packs.first().map(|p| p.id.clone());
     core.save_config();
@@ -1675,8 +2137,24 @@ pub fn run() -> Result<()> {
         });
     }
 
+    let check_timer = slint::Timer::default();
+    {
+        let (c, w) = (core.clone(), ui.as_weak());
+        check_timer.start(slint::TimerMode::Repeated, Duration::from_secs(2), move || {
+            if let Some(ui) = w.upgrade() {
+                status_tick(&ui, &c);
+            }
+        });
+    }
+
     ui.run()?;
     drop(timer);
+    drop(check_timer);
+    // Arrête une vérification en cours : l'instance de Factorio ne doit pas survivre à l'app.
+    if let Some(run) = core.lock().unwrap().check.take() {
+        run.cancel.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }
 
@@ -2342,9 +2820,10 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
         let mut k = c.lock().unwrap();
         let Some(id) = k.selected_pack.clone() else { return };
         let (index, builtins, game) = (k.index.clone(), k.builtins.clone(), k.target_factorio(None));
+        let found = k.state.found_incompatibilities.clone();
         let Some(pack) = k.state.pack_mut(&id) else { return };
-        let off = modpack::auto_disable(pack, &index, &builtins, &game);
-        let left = modpack::pack_issues(pack, &index, &builtins, &game).len();
+        let off = modpack::auto_disable(pack, &index, &builtins, &game, &found);
+        let left = modpack::pack_issues(pack, &index, &builtins, &game, &found).len();
         k.save_state();
         refresh_all(&ui, &k);
         let mut msg = format!("{} mod(s) désactivé(s) : {}.", off.len(), off.join(", "));
@@ -2591,6 +3070,79 @@ fn wire_dialogs(ui: &AppWindow, core: &Shared) {
         let ui = w.unwrap();
         proceed(&ui, &c, After::Launch(None));
     });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_fail_disable(move |name| {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let off = disable_everywhere(&mut k, &name);
+        refresh_failure(&ui, &k);
+        refresh_all(&ui, &k);
+        refresh_pack_detail(&ui, &k, false);
+        let msg = if off.len() > 1 {
+            format!("{name} désactivé, ainsi que {} mod(s) qui en dépendaient : {}.", off.len() - 1, off[1..].join(", "))
+        } else {
+            format!("{name} désactivé dans les modpacks actifs.")
+        };
+        ui.set_status(msg.into());
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_fail_bisect(move || start_bisect(&w.unwrap(), &c));
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_fail_launch(move || {
+        let ui = w.unwrap();
+        ui.set_fail_visible(false);
+        let save = c.lock().unwrap().failure.as_ref().and_then(|f| f.save.clone());
+        proceed(&ui, &c, After::Launch(save));
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_fail_launch_anyway(move || {
+        let ui = w.unwrap();
+        let save = c.lock().unwrap().failure.as_ref().and_then(|f| f.save.clone());
+        do_launch(&ui, &c, save, None);
+    });
+    let w = ui.as_weak();
+    ui.on_fail_close(move || w.unwrap().set_fail_visible(false));
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_show_failure(move || {
+        let ui = w.unwrap();
+        refresh_failure(&ui, &c.lock().unwrap());
+        ui.set_fail_visible(true);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_check_now(move || {
+        let ui = w.unwrap();
+        {
+            let mut k = c.lock().unwrap();
+            if k.config.factorio_exe.is_none() {
+                ui.set_status("Configure l'exécutable de Factorio dans Paramètres.".into());
+                return;
+            }
+            if !k.resolution().conflicts.is_empty() {
+                drop(k);
+                proceed(&ui, &c, After::Nothing);
+                return;
+            }
+            if let Some(run) = k.check.take() {
+                if run.bisecting {
+                    k.check = Some(run);
+                    ui.set_status("Recherche du conflit en cours : attends sa fin ou annule-la.".into());
+                    return;
+                }
+                run.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        start_check(&ui, &c, None, true);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_cancel_check(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        if let Some(run) = k.check.take() {
+            run.cancel.store(true, Ordering::SeqCst);
+        }
+        ui.set_check_running(false);
+        ui.set_status("Vérification annulée.".into());
+    });
 }
 
 fn wire_settings(ui: &AppWindow, core: &Shared) {
@@ -2617,6 +3169,8 @@ fn wire_settings(ui: &AppWindow, core: &Shared) {
         k.config.copy_back_settings = ui.get_s_copy_back();
         k.config.check_interval_minutes = ui.get_s_interval().trim().parse().unwrap_or(10).clamp(1, 1440);
         k.config.auto_update_app = ui.get_s_auto_app();
+        k.config.check_before_launch = ui.get_s_check_launch();
+        k.config.cache_sprite_atlas = ui.get_s_sprite_cache();
         k.refresh_factorio();
         k.save_config();
         refresh_settings(&ui, &k);

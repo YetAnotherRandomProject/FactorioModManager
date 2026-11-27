@@ -79,6 +79,12 @@ pub struct Config {
     /// Vérifier les nouvelles versions de l'application sur GitHub.
     #[serde(default = "t")]
     pub auto_update_app: bool,
+    /// Vérifier le chargement des mods (instance isolée, sans sprites) avant de lancer le jeu.
+    #[serde(default = "t")]
+    pub check_before_launch: bool,
+    /// Passer --cache-sprite-atlas au jeu : les lancements suivants avec les mêmes mods sont plus rapides.
+    #[serde(default = "t")]
+    pub cache_sprite_atlas: bool,
 }
 
 fn ten() -> u32 {
@@ -103,6 +109,8 @@ impl Default for Config {
             copy_back_settings: true,
             check_interval_minutes: 10,
             auto_update_app: true,
+            check_before_launch: true,
+            cache_sprite_atlas: true,
         }
     }
 }

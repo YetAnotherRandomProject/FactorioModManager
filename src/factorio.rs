@@ -184,7 +184,7 @@ impl ModList {
 }
 
 /// Lance le jeu, éventuellement avec un dossier de mods dédié et une sauvegarde.
-pub fn launch(exe: &Path, mod_dir: Option<&Path>, save: Option<&Path>) -> Result<Child> {
+pub fn launch(exe: &Path, mod_dir: Option<&Path>, save: Option<&Path>, extra: &[&str]) -> Result<Child> {
     let mut cmd = Command::new(exe);
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
@@ -195,6 +195,7 @@ pub fn launch(exe: &Path, mod_dir: Option<&Path>, save: Option<&Path>) -> Result
     if let Some(s) = save {
         cmd.arg("--load-game").arg(s);
     }
+    cmd.args(extra);
     cmd.spawn().with_context(|| format!("impossible de lancer {}", exe.display()))
 }
 

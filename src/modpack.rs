@@ -78,6 +78,9 @@ pub struct State {
     /// Choix mémorisés pour les conflits de versions : nom du mod -> version.
     #[serde(default)]
     pub conflict_choices: BTreeMap<String, String>,
+    /// Incompatibilités non déclarées, découvertes en vérifiant le chargement des mods.
+    #[serde(default)]
+    pub found_incompatibilities: Vec<(String, String)>,
 }
 
 impl State {
@@ -185,9 +188,20 @@ impl Issue {
 /// Problèmes d'une résolution : mods absents du dépôt, prévus pour une autre version de Factorio,
 /// dépendances obligatoires manquantes ou de mauvaise version, DLC requis désactivé, incompatibilités.
 /// `game` : version du jeu installé (vide = pas de contrôle de version).
-pub fn issues(res: &Resolution, index: &Index, builtins: &[String], game: &str) -> Vec<Issue> {
+pub fn issues(res: &Resolution, index: &Index, builtins: &[String], game: &str, found: &[(String, String)]) -> Vec<Issue> {
     let mut out = Vec::new();
     let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    for (a, b) in found {
+        if res.mods.contains_key(a) && res.mods.contains_key(b) {
+            let pair = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+            if pairs.insert(pair) {
+                out.push(Issue {
+                    text: format!("{a} est incompatible avec {b} (détecté au chargement)"),
+                    disable: vec![a.clone(), b.clone()],
+                });
+            }
+        }
+    }
     for (name, ver) in &res.mods {
         let one = |text: String| Issue { text, disable: vec![name.clone()] };
         let Some(info) = crate::store::find(index, name, ver) else {
@@ -236,12 +250,12 @@ pub fn issues(res: &Resolution, index: &Index, builtins: &[String], game: &str) 
 /// Désactive dans le modpack tous les mods en cause d'un problème à candidat unique, jusqu'à ce
 /// qu'il n'en reste plus (un mod qui dépendait d'un mod désactivé l'est à son tour).
 /// Les incompatibilités, qui demandent un choix, ne sont pas traitées. Renvoie les mods désactivés.
-pub fn auto_disable(pack: &mut Modpack, index: &Index, builtins: &[String], game: &str) -> Vec<String> {
+pub fn auto_disable(pack: &mut Modpack, index: &Index, builtins: &[String], game: &str, found: &[(String, String)]) -> Vec<String> {
     let mut disabled = Vec::new();
     loop {
         let single = State { packs: vec![pack.clone()], active: vec![pack.id.clone()], ..Default::default() };
         let res = resolve(&single, &BTreeMap::new());
-        let names: BTreeSet<String> = issues(&res, index, builtins, game)
+        let names: BTreeSet<String> = issues(&res, index, builtins, game, found)
             .into_iter()
             .filter(Issue::is_automatic)
             .flat_map(|i| i.disable)
@@ -257,9 +271,9 @@ pub fn auto_disable(pack: &mut Modpack, index: &Index, builtins: &[String], game
 }
 
 /// Problèmes d'un modpack pris seul.
-pub fn pack_issues(pack: &Modpack, index: &Index, builtins: &[String], game: &str) -> Vec<Issue> {
+pub fn pack_issues(pack: &Modpack, index: &Index, builtins: &[String], game: &str, found: &[(String, String)]) -> Vec<Issue> {
     let single = State { packs: vec![pack.clone()], active: vec![pack.id.clone()], ..Default::default() };
-    issues(&resolve(&single, &BTreeMap::new()), index, builtins, game)
+    issues(&resolve(&single, &BTreeMap::new()), index, builtins, game, found)
 }
 
 #[cfg(test)]
@@ -324,13 +338,13 @@ mod tests {
         let mut p = pack("P", &[("old", "1.0.0"), ("uses-old", "1.0.0"), ("a", "1.0.0"), ("b", "1.0.0"), ("ok", "1.0.0")]);
         let builtins = vec!["base".to_string()];
 
-        let before = pack_issues(&p, &index, &builtins, "2.1");
+        let before = pack_issues(&p, &index, &builtins, "2.1", &[]);
         assert_eq!(before.iter().filter(|i| !i.is_automatic()).count(), 1, "une seule entrée pour la paire a/b");
 
-        let mut off = auto_disable(&mut p, &index, &builtins, "2.1");
+        let mut off = auto_disable(&mut p, &index, &builtins, "2.1", &[]);
         off.sort();
         assert_eq!(off, vec!["old".to_string(), "uses-old".to_string()]);
-        let after = pack_issues(&p, &index, &builtins, "2.1");
+        let after = pack_issues(&p, &index, &builtins, "2.1", &[]);
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].disable, vec!["a".to_string(), "b".to_string()]);
         assert!(p.entry("ok").unwrap().enabled);
