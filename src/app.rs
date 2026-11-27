@@ -928,23 +928,8 @@ fn build_items(portal: &Portal, index: &Index, builtins: &[String], target: &str
             },
         });
     }
-    for dep in deps.iter().filter(|d| d.kind == DepKind::Incompatible) {
-        let present = index.contains_key(&dep.name);
-        items.push(DlItem {
-            name: dep.name.clone(),
-            kind: dep.kind,
-            constraint: Some(dep.clone()),
-            release: None,
-            installed: None,
-            checked: false,
-            checkable: false,
-            status: if present {
-                "⚠ Présent dans ton dépôt : ne pas l'activer avec ce mod".into()
-            } else {
-                "Ne doit pas être chargé avec ce mod".into()
-            },
-        });
-    }
+    // Les mods incompatibles (« ! ») ne sont pas proposés : ce ne sont pas des dépendances à ajouter.
+    // Les conflits éventuels restent signalés dans les problèmes détectés du modpack.
     items.sort_by_key(|i| (i.kind.group(), i.name.to_lowercase()));
     items
 }
