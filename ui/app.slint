@@ -11,11 +11,33 @@ export struct ModRow {
     versions-count: int,
     update: string,
     packs: string,
+    // Où la recherche a été trouvée (ID, modpack, auteur), vide sinon.
+    hint: string,
+    // Valeur du tri choisi (taille, date…).
+    sort-info: string,
     active: bool,
     incompatible: bool,
     checked: bool,
     downloading: bool,
     progress: float,
+}
+
+export struct UpdRow {
+    name: string,
+    title: string,
+    from: string,
+    to: string,
+    source: string,
+    changelog: string,
+    checked: bool,
+}
+
+export struct UpdOptRow {
+    name: string,
+    info: string,
+    required: bool,
+    checked: bool,
+    checkable: bool,
 }
 
 export struct VersionRow {
@@ -73,6 +95,7 @@ export struct PackModRow {
     versions: [string],
     version-index: int,
     enabled: bool,
+    pinned: bool,
     missing: bool,
     downloading: bool,
     progress: float,
@@ -247,6 +270,8 @@ component ModCard inherits Rectangle {
     }
     HorizontalLayout {
         padding: 8px;
+        // Place pour la barre de défilement de la liste.
+        padding-right: 18px;
         spacing: 10px;
         CheckBox {
             width: 24px;
@@ -277,21 +302,35 @@ component ModCard inherits Rectangle {
                 overflow: elide;
                 font-size: 12px;
             }
-            Text {
+            if root.data.hint == "": Text {
                 text: root.data.packs != "" ? "Modpacks : " + root.data.packs : "Aucun modpack";
                 color: root.selected ? Palette.selection-foreground : Theme.muted;
                 overflow: elide;
                 font-size: 11px;
             }
+            if root.data.hint != "": Text {
+                text: "» " + root.data.hint;
+                color: root.selected ? Palette.selection-foreground : Palette.accent-background;
+                font-weight: 600;
+                overflow: elide;
+                font-size: 11px;
+            }
         }
         VerticalLayout {
-            width: 96px;
+            width: 104px;
             spacing: 3px;
             alignment: center;
             Text {
                 text: root.data.version;
                 color: root.selected ? Palette.selection-foreground : Theme.muted;
                 font-size: 12px;
+                horizontal-alignment: right;
+                overflow: elide;
+            }
+            if root.data.sort-info != "": Text {
+                text: root.data.sort-info;
+                color: root.selected ? Palette.selection-foreground : Theme.muted;
+                font-size: 11px;
                 horizontal-alignment: right;
                 overflow: elide;
             }
@@ -355,9 +394,16 @@ export component AppWindow inherits Window {
     icon: @image-url("icon.png");
 
     in-out property <int> page: 0;
+    forward-focus: keys;
+    // Incrémenté par Ctrl+F : le champ de filtre de la page affichée prend le focus.
+    property <int> focus-req: 0;
 
     // ---------- Barre d'état ----------
     in property <string> status: "Prêt";
+    callback status-logged(string);
+    changed status => {
+        root.status-logged(self.status);
+    }
     in property <bool> busy: false;
     in property <float> progress: -1;
     in property <string> active-summary: "";
@@ -390,6 +436,11 @@ export component AppWindow inherits Window {
     in property <int> library-total: 0;
     in-out property <string> library-filter: "";
     in-out property <int> library-mode: 0;
+    in-out property <int> library-sort: 0;
+    in property <int> updates-count: 0;
+    callback update-all();
+    callback clean-repo();
+    callback close-detail();
     in property <string> selected-mod: "";
     in property <bool> detail-visible: false;
     in property <string> detail-title;
@@ -510,6 +561,27 @@ export component AppWindow inherits Window {
     in property <int> pack-mods-total: 0;
     callback pack-mod-filter-changed();
     callback pack-add(string, bool);
+    in property <string> pack-undo-label: "";
+    callback pack-update();
+    callback pack-undo();
+
+    // ---------- Mises à jour ----------
+    in property <bool> upd-visible: false;
+    in property <bool> upd-loading: false;
+    in property <string> upd-title;
+    in property <[UpdRow]> upd-rows: [];
+    in property <[UpdOptRow]> upd-opts: [];
+    in property <int> upd-count: 0;
+    callback upd-toggle(int, bool);
+    callback upd-opt-toggle(int, bool);
+    callback upd-confirm();
+    callback upd-cancel();
+
+    // ---------- Journal ----------
+    in property <string> journal-text: "";
+    callback journal-refresh();
+    callback journal-open-file();
+    callback journal-clear();
 
     // ---------- Conflits ----------
     in property <bool> conflict-visible: false;
@@ -557,6 +629,48 @@ export component AppWindow inherits Window {
     callback browse-exe();
     callback open-data-dir();
 
+    keys := FocusScope {
+    width: 100%;
+    height: 100%;
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            if (root.upd-visible) {
+                root.upd-cancel();
+                return accept;
+            }
+            if (root.dl-visible) {
+                root.dl-cancel();
+                return accept;
+            }
+            if (root.confirm-visible) {
+                root.confirm-cancel();
+                return accept;
+            }
+            if (root.fail-visible) {
+                root.fail-close();
+                return accept;
+            }
+            if (root.conflict-visible) {
+                root.conflict-cancel();
+                return accept;
+            }
+            if (root.page == 0 && root.detail-visible) {
+                root.close-detail();
+                return accept;
+            }
+            return reject;
+        }
+        if (event.modifiers.control && (event.text == "f" || event.text == "F")) {
+            root.focus-req += 1;
+            return accept;
+        }
+        if (event.text == Key.Delete && root.page == 0 && root.lib-selected-count > 0 && !root.confirm-visible && !root.dl-visible && !root.upd-visible) {
+            root.bulk-delete();
+            return accept;
+        }
+        reject
+    }
+
     HorizontalLayout {
         // ---------- Barre latérale ----------
         Rectangle {
@@ -598,6 +712,14 @@ export component AppWindow inherits Window {
                     selected: root.page == 3;
                     clicked => {
                         root.page = 3;
+                    }
+                }
+                NavButton {
+                    text: "Journal";
+                    selected: root.page == 4;
+                    clicked => {
+                        root.page = 4;
+                        root.journal-refresh();
                     }
                 }
                 Rectangle { }
@@ -741,15 +863,20 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 6px;
                             LineEdit {
-                                placeholder-text: "Filtrer les mods installés…";
+                                placeholder-text: "Filtrer les mods installés (ID, nom, modpack, auteur)… — Ctrl+F";
                                 text <=> root.library-filter;
+                                property <int> req: root.focus-req;
+                                changed req => {
+                                    self.focus();
+                                    self.select-all();
+                                }
                                 edited => {
                                     root.library-filter-changed();
                                 }
                             }
                             ComboBox {
                                 width: 150px;
-                                model: ["Tous", "Actifs", "Non utilisés", "Mises à jour"];
+                                model: ["Tous", "Actifs", "Non utilisés", "Mises à jour", "Incompatibles"];
                                 current-index <=> root.library-mode;
                                 selected => {
                                     root.library-filter-changed();
@@ -782,6 +909,21 @@ export component AppWindow inherits Window {
                                     root.refresh-library();
                                 }
                             }
+                            Button {
+                                horizontal-stretch: 1;
+                                preferred-width: 10px;
+                                text: "Nettoyer le dépôt";
+                                clicked => {
+                                    root.clean-repo();
+                                }
+                            }
+                        }
+                        if root.updates-count > 0: Button {
+                            text: "Tout mettre à jour (" + root.updates-count + ")";
+                            primary: true;
+                            clicked => {
+                                root.update-all();
+                            }
                         }
                         HorizontalLayout {
                             spacing: 6px;
@@ -790,6 +932,15 @@ export component AppWindow inherits Window {
                                 color: Theme.muted;
                                 font-size: 12px;
                                 vertical-alignment: center;
+                            }
+                            ComboBox {
+                                width: 190px;
+                                height: 28px;
+                                model: ["Tri : nom", "Tri : téléchargement", "Tri : taille", "Tri : dernière MàJ"];
+                                current-index <=> root.library-sort;
+                                selected => {
+                                    root.library-filter-changed();
+                                }
                             }
                             Button {
                                 width: 150px;
@@ -847,6 +998,15 @@ export component AppWindow inherits Window {
                                         Text {
                                             text: "Factorio " + root.detail-factorio;
                                             color: Theme.muted;
+                                        }
+                                    }
+                                    VerticalLayout {
+                                        alignment: start;
+                                        IconButton {
+                                            tooltip: "Fermer (Échap)";
+                                            clicked => {
+                                                root.close-detail();
+                                            }
                                         }
                                     }
                                 }
@@ -1062,6 +1222,11 @@ export component AppWindow inherits Window {
                         spacing: 6px;
                         LineEdit {
                             placeholder-text: "Rechercher sur le portail (nom, titre, auteur, description)…";
+                            property <int> req: root.focus-req;
+                            changed req => {
+                                self.focus();
+                                self.select-all();
+                            }
                             text <=> root.search-query;
                             accepted => {
                                 root.do-search();
@@ -1295,6 +1460,16 @@ export component AppWindow inherits Window {
                                     text: "Basé sur le modpack du portail : " + root.pack-base-mod;
                                     color: Theme.muted;
                                 }
+                                if root.pack-undo-label != "": HorizontalLayout {
+                                    spacing: 8px;
+                                    alignment: start;
+                                    Button {
+                                        text: "↶ " + root.pack-undo-label;
+                                        clicked => {
+                                            root.pack-undo();
+                                        }
+                                    }
+                                }
                                 if root.pack-factorio-warning != "" && root.s-feat-version: Text {
                                     text: root.pack-factorio-warning;
                                     color: Theme.warn;
@@ -1308,6 +1483,12 @@ export component AppWindow inherits Window {
                                         primary: true;
                                         clicked => {
                                             root.save-pack-meta();
+                                        }
+                                    }
+                                    ActionButton {
+                                        text: "Mettre à jour…";
+                                        clicked => {
+                                            root.pack-update();
                                         }
                                     }
                                     ActionButton {
@@ -1473,7 +1654,12 @@ export component AppWindow inherits Window {
                                     }
                                     LineEdit {
                                         width: 280px;
-                                        placeholder-text: "Filtrer les mods du modpack…";
+                                        placeholder-text: "Filtrer les mods du modpack… — Ctrl+F";
+                                        property <int> req: root.focus-req;
+                                        changed req => {
+                                            self.focus();
+                                            self.select-all();
+                                        }
                                         text <=> root.pack-mod-filter;
                                         edited => {
                                             root.pack-mod-filter-changed();
@@ -1564,7 +1750,7 @@ export component AppWindow inherits Window {
                                                 color: m.downloading ? Theme.muted : Palette.foreground;
                                             }
                                             Text {
-                                                text: m.downloading ? m.name + " — téléchargement " + Math.round(m.progress * 100) + " %" : m.missing ? m.name + " — absent du dépôt" : m.name;
+                                                text: m.downloading ? m.name + " — téléchargement " + Math.round(m.progress * 100) + " %" : m.missing ? m.name + " — absent du dépôt" : m.pinned ? m.name + " — version fixée à la main" : m.name;
                                                 color: m.missing ? Theme.warn : Theme.muted;
                                                 font-size: 11px;
                                                 overflow: elide;
@@ -1796,6 +1982,47 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
+                    }
+                }
+
+                // ===== Journal =====
+                if root.page == 4: VerticalLayout {
+                    padding: 14px;
+                    spacing: 8px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        SectionTitle {
+                            text: "Journal : téléchargements, synchronisations, lancements et erreurs";
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+                        ActionButton {
+                            text: "Actualiser";
+                            clicked => {
+                                root.journal-refresh();
+                            }
+                        }
+                        ActionButton {
+                            text: "Ouvrir le fichier";
+                            clicked => {
+                                root.journal-open-file();
+                            }
+                        }
+                        ActionButton {
+                            text: "Effacer";
+                            clicked => {
+                                root.journal-clear();
+                            }
+                        }
+                    }
+                    TextEdit {
+                        vertical-stretch: 1;
+                        read-only: true;
+                        wrap: no-wrap;
+                        font-size: 12px;
+                        text: root.journal-text;
                     }
                 }
             }
@@ -2159,6 +2386,141 @@ export component AppWindow inherits Window {
         }
     }
 
+    // ---------- Mises à jour ----------
+    if root.upd-visible: Overlay {
+        dialog-width: 860px;
+        dialog-height: 700px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.upd-title;
+                font-size: 18px;
+                font-weight: 700;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+            if root.upd-loading: Spinner {
+                width: 22px;
+                height: 22px;
+                indeterminate: true;
+            }
+        }
+        Text {
+            text: root.upd-loading ? "Lecture des changelogs et des dépendances sur le portail…" : "Les modpacks qui utilisaient l'ancienne version passent à la nouvelle (sauf versions fixées à la main). Leur état précédent est mémorisé : tu pourras y revenir depuis la fiche du modpack.";
+            color: Theme.muted;
+            wrap: word-wrap;
+        }
+        Rectangle {
+            vertical-stretch: 3;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 6px;
+            ListView {
+                for u[i] in root.upd-rows: Rectangle {
+                    background: Math.mod(i, 2) == 0 ? Palette.control-background : transparent;
+                    VerticalLayout {
+                        padding: 8px;
+                        spacing: 4px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            CheckBox {
+                                horizontal-stretch: 0;
+                                checked: u.checked;
+                                toggled => {
+                                    root.upd-toggle(i, self.checked);
+                                }
+                            }
+                            Text {
+                                text: u.title;
+                                font-weight: 700;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                horizontal-stretch: 0;
+                                text: u.from + "  →  " + u.to + "   (" + u.source + ")";
+                                color: Theme.muted;
+                                vertical-alignment: center;
+                            }
+                        }
+                        if u.changelog != "": Text {
+                            text: u.changelog;
+                            color: Theme.muted;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+        if root.upd-opts.length > 0: Text {
+            text: "Nouvelles dépendances (les obligatoires sont ajoutées d'office ; coche les optionnelles à ajouter) :";
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+        if root.upd-opts.length > 0: Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 6px;
+            ListView {
+                for o[i] in root.upd-opts: HorizontalLayout {
+                    height: 40px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+                    CheckBox {
+                        horizontal-stretch: 0;
+                        checked: o.checked;
+                        enabled: o.checkable;
+                        toggled => {
+                            root.upd-opt-toggle(i, self.checked);
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Text {
+                            text: o.name;
+                            font-weight: 600;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: o.info;
+                            color: Theme.muted;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                    }
+                    Badge {
+                        height: 18px;
+                        y: 11px;
+                        text: o.required ? "obligatoire" : "optionnelle";
+                        bg: o.required ? Palette.accent-background : Palette.control-background;
+                        fg: o.required ? Palette.accent-foreground : Palette.foreground;
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            ActionButton {
+                text: "Annuler";
+                clicked => {
+                    root.upd-cancel();
+                }
+            }
+            ActionButton {
+                text: "Mettre à jour (" + root.upd-count + ")";
+                primary: true;
+                enabled: !root.upd-loading && root.upd-count > 0;
+                clicked => {
+                    root.upd-confirm();
+                }
+            }
+        }
+    }
+
     // ---------- Confirmation ----------
     if root.confirm-visible: Overlay {
         dialog-width: 600px;
@@ -2169,18 +2531,11 @@ export component AppWindow inherits Window {
             font-weight: 700;
             wrap: word-wrap;
         }
-        Rectangle {
+        TextEdit {
             vertical-stretch: 1;
-            clip: true;
-            Text {
-                x: 0;
-                y: 0;
-                width: parent.width;
-                height: parent.height;
-                text: root.confirm-text;
-                wrap: word-wrap;
-                vertical-alignment: top;
-            }
+            read-only: true;
+            wrap: word-wrap;
+            text: root.confirm-text;
         }
         HorizontalLayout {
             spacing: 8px;
@@ -2199,5 +2554,6 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
     }
 }

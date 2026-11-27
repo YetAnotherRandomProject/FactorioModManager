@@ -15,12 +15,19 @@ fn t() -> bool {
     true
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PackEntry {
     pub name: String,
     pub version: String,
     #[serde(default = "t")]
     pub enabled: bool,
+    /// Version choisie à la main : le modpack ne suit pas les mises à jour de ce mod.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -41,7 +48,20 @@ pub struct Modpack {
     pub disabled_builtins: Vec<String>,
     #[serde(default)]
     pub saves: Vec<PathBuf>,
+    /// États précédents des mods (avant chaque mise à jour), le plus récent en dernier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<PackSnapshot>,
 }
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PackSnapshot {
+    /// Date lisible de la mise à jour qui a suivi cet état.
+    pub at: String,
+    pub mods: Vec<PackEntry>,
+}
+
+/// Nombre d'états conservés par modpack.
+const HISTORY_LEN: usize = 10;
 
 impl Modpack {
     pub fn new(name: &str) -> Modpack {
@@ -53,9 +73,34 @@ impl Modpack {
         if let Some(e) = self.mods.iter_mut().find(|e| e.name == name) {
             e.version = version.to_string();
         } else {
-            self.mods.push(PackEntry { name: name.to_string(), version: version.to_string(), enabled: true });
+            self.mods.push(PackEntry { name: name.to_string(), version: version.to_string(), enabled: true, pinned: false });
             self.mods.sort_by_key(|e| e.name.to_lowercase());
         }
+    }
+
+    /// Marque la version d'un mod comme choisie à la main (ou non).
+    pub fn set_pinned(&mut self, name: &str, pinned: bool) {
+        if let Some(e) = self.mods.iter_mut().find(|e| e.name == name) {
+            e.pinned = pinned;
+        }
+    }
+
+    /// Mémorise l'état `mods` (avant modification) pour pouvoir y revenir.
+    pub fn push_history(&mut self, mods: Vec<PackEntry>, at: String) {
+        if self.history.last().map(|h| h.mods == mods).unwrap_or(false) || mods == self.mods {
+            return;
+        }
+        self.history.push(PackSnapshot { at, mods });
+        if self.history.len() > HISTORY_LEN {
+            self.history.remove(0);
+        }
+    }
+
+    /// Revient à l'état précédant la dernière mise à jour. Renvoie sa date.
+    pub fn undo(&mut self) -> Option<String> {
+        let snap = self.history.pop()?;
+        self.mods = snap.mods;
+        Some(snap.at)
     }
 
     pub fn entry(&self, name: &str) -> Option<&PackEntry> {
@@ -287,6 +332,19 @@ mod tests {
             p.set_mod(n, &v.parse().unwrap());
         }
         p
+    }
+
+    #[test]
+    fn history_undo() {
+        let mut p = pack("A", &[("foo", "1.0.0")]);
+        let before = p.mods.clone();
+        p.set_mod("foo", &"1.1.0".parse().unwrap());
+        p.push_history(before.clone(), "hier".into());
+        p.push_history(p.mods.clone(), "doublon ignoré".into());
+        assert_eq!(p.history.len(), 1);
+        assert_eq!(p.undo().as_deref(), Some("hier"));
+        assert_eq!(p.mods, before);
+        assert!(p.undo().is_none());
     }
 
     #[test]

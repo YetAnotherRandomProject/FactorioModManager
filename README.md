@@ -10,7 +10,10 @@ Gestionnaire de mods et de modpacks pour Factorio, en Rust avec une interface na
 - **Modpacks** : plusieurs modpacks actifs en même temps, création depuis un mod de la catégorie « modpack », ajout de mods depuis la vue du pack, DLC par pack, réglages des mods (`mod-settings.dat`), sauvegardes liées, export / import (`.fmpack`).
 - **Conflits** : si deux modpacks actifs demandent des versions différentes d'un mod, l'application demande laquelle charger.
 - **Deux modes d'application** : synchroniser le dossier `mods/` de Factorio (avec aperçu et sauvegarde de `mod-list.json`) ou lancer le jeu avec un dossier de mods dédié (`--mod-directory`).
-- **Mises à jour** : vérification régulière des mods (intervalle réglable) et mise à jour automatique de l'application depuis les releases GitHub.
+- **Mises à jour** : vérification régulière des mods (intervalle réglable), « Tout mettre à jour » avec le changelog de chaque mod et les nouvelles dépendances (obligatoires ajoutées d'office, optionnelles au choix) ; les modpacks suivent la dernière version sauf version fixée à la main. Mise à jour d'un seul modpack avec aperçu, et retour à l'état précédent. Mise à jour automatique de l'application depuis les releases GitHub.
+- **Bibliothèque** : recherche par ID, nom, modpack et auteur (avec l'endroit trouvé), filtres (actifs, non utilisés, mises à jour, incompatibles), tri (nom, téléchargement, taille, dernière mise à jour), nettoyage des anciennes versions inutilisées avec la place libérée.
+- **Fiabilité** : SHA1 vérifié et nouvel essai automatique des téléchargements, sauvegarde de `mod-list.json` et `mod-settings.dat` à chaque synchronisation, journal consultable dans l'app.
+- **Confort** : `Ctrl+F` (filtre), `Échap` (fermer), `Suppr` (supprimer la sélection), glisser-déposer de zips de mods ou de `.fmpack`, icône dans la zone de notification (Windows) pour lancer le jeu avec les modpacks actifs.
 
 Les identifiants du portail sont lus depuis `player-data.json` (connexion au portail faite dans le jeu), ou saisis dans les paramètres.
 

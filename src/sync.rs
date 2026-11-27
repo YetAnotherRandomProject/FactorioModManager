@@ -168,6 +168,9 @@ pub fn apply(mods_dir: &Path, plan: &SyncPlan, settings: Option<&Path>) -> Resul
     if let Some(s) = settings.filter(|s| s.exists()) {
         let dst = mods_dir.join("mod-settings.dat");
         backup_once(&dst, "fmm-original");
+        if dst.exists() {
+            let _ = fs::copy(&dst, mods_dir.join("mod-settings.dat.fmm-backup"));
+        }
         fs::copy(s, dst)?;
     }
     Ok(())

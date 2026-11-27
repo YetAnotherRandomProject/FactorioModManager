@@ -14,6 +14,7 @@ use crate::check::{self, CheckDirs};
 use crate::config::{Config, Paths};
 use crate::factorio::{self, ModList};
 use crate::instance;
+use crate::journal;
 use crate::modpack::{self, Conflict, Modpack, PackEntry, Resolution, State};
 use crate::portal::{self, ModListEntry, Portal, Release};
 use crate::store::{self, AddMode, Index, Store};
@@ -22,7 +23,8 @@ use crate::transfer;
 use crate::updater::{self, AppRelease};
 use crate::version::{DepKind, Dependency, Version, factorio_compatible, is_builtin, same_major_minor};
 use crate::{
-    AddRow, AppWindow, FailRow, IssueRow, BuiltinRow, ConflictRow, DepRow, ModRow, PackModRow, PackRow, SaveRow, SearchRow, VersionRow,
+    AddRow, AppWindow, FailRow, IssueRow, BuiltinRow, ConflictRow, DepRow, ModRow, PackModRow, PackRow, SaveRow, SearchRow, UpdOptRow,
+    UpdRow, VersionRow,
 };
 
 type Shared = Arc<Mutex<Core>>;
@@ -70,6 +72,41 @@ struct DlSession {
     offer_pack: bool,
 }
 
+/// Mod à mettre à jour (fenêtre « Mises à jour »).
+#[derive(Clone, Debug)]
+struct UpdItem {
+    name: String,
+    title: String,
+    from: Version,
+    to: Version,
+    /// Release à télécharger ; `None` si la version est déjà dans le dépôt.
+    release: Option<Release>,
+    changelog: String,
+    checked: bool,
+}
+
+/// Dépendance apparue avec une mise à jour.
+#[derive(Clone, Debug)]
+struct UpdOpt {
+    name: String,
+    /// Mods mis à jour qui l'ont ajoutée.
+    for_mods: Vec<String>,
+    required: bool,
+    release: Option<Release>,
+    installed: Option<Version>,
+    checked: bool,
+    checkable: bool,
+    status: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UpdSession {
+    items: Vec<UpdItem>,
+    opts: Vec<UpdOpt>,
+    /// Mise à jour d'un seul modpack (sinon : tous les modpacks qui suivent les mises à jour).
+    pack: Option<String>,
+}
+
 enum After {
     Nothing,
     Sync,
@@ -82,6 +119,8 @@ enum Confirm {
     DeleteVersion(String, Version),
     /// Suppression groupée du dépôt (mods non utilisés par un modpack).
     BulkDelete(Vec<String>),
+    /// Nettoyage : anciennes versions qu'aucun modpack n'utilise.
+    CleanRepo(Vec<store::ModInfo>),
 }
 
 /// Vérification du chargement des mods en cours (instance isolée de Factorio).
@@ -152,6 +191,7 @@ pub struct Core {
     game_running: bool,
     /// Fichiers introuvables relevés par la dernière vérification de chaque ensemble.
     pending_missing: HashMap<String, BTreeSet<String>>,
+    upd: Option<UpdSession>,
 }
 
 impl Core {
@@ -293,6 +333,32 @@ fn thousands(n: u64) -> String {
     out
 }
 
+/// Taille lisible (« 12,3 Mo »).
+fn human_size(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 1024.0 {
+        format!("{:.2} Go", mb / 1024.0).replace('.', ",")
+    } else if mb >= 1.0 {
+        format!("{mb:.1} Mo").replace('.', ",")
+    } else {
+        format!("{} Ko", bytes.div_ceil(1024))
+    }
+}
+
+fn local_date(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|d| d.with_timezone(&chrono::Local).format("%d/%m/%Y").to_string())
+        .unwrap_or_default()
+}
+
+fn now_label() -> String {
+    chrono::Local::now().format("%d/%m/%Y %H:%M").to_string()
+}
+
+fn file_size(p: &Path) -> u64 {
+    fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
 fn post_status(w: &Weak<AppWindow>, msg: impl Into<String>) {
     let msg = msg.into();
     let _ = w.upgrade_in_event_loop(move |ui| ui.set_status(msg.into()));
@@ -354,9 +420,53 @@ fn portal_summary<'a>(k: &'a Core, name: &str) -> Option<&'a ModListEntry> {
     k.portal_list.as_ref()?.iter().find(|m| m.name == name)
 }
 
+/// Pertinence d'un mod pour la recherche (plus petit = mieux classé) et indication de l'endroit
+/// où la recherche a été trouvée, `None` s'il ne correspond pas.
+/// Priorité : ID, puis nom affiché, puis modpacks, puis auteur. Chaque mot de la requête doit être
+/// trouvé quelque part ; le rang est celui du mot le moins bien placé.
+fn library_match(filter: &str, id: &str, title: &str, packs: &[String], author: &str) -> Option<(u8, String)> {
+    let lid = id.to_lowercase();
+    let ltitle = title.to_lowercase();
+    let lauthor = author.to_lowercase();
+    let lpacks: Vec<String> = packs.iter().map(|p| p.to_lowercase()).collect();
+    let mut worst = (0u8, String::new());
+    for word in filter.split_whitespace() {
+        // L'ID n'est pas affiché dans les listes : on le montre s'il est la raison du résultat.
+        let id_hint = || if ltitle.contains(word) { String::new() } else { format!("ID : {id}") };
+        let (rank, hint) = if lid == word {
+            (0, id_hint())
+        } else if lid.starts_with(word) {
+            (1, id_hint())
+        } else if lid.contains(word) {
+            (2, id_hint())
+        } else if ltitle.starts_with(word) {
+            (3, String::new())
+        } else if ltitle.contains(word) {
+            (4, String::new())
+        } else if lpacks.iter().any(|p| p.contains(word)) {
+            let found: Vec<&str> =
+                packs.iter().zip(&lpacks).filter(|(_, l)| l.contains(word)).map(|(p, _)| p.as_str()).collect();
+            (5, format!("Trouvé dans le modpack : {}", found.join(", ")))
+        } else if lauthor.contains(word) {
+            (6, format!("Auteur : {author}"))
+        } else {
+            return None;
+        };
+        if rank > worst.0 || (rank == worst.0 && worst.1.is_empty()) {
+            worst = (rank, hint);
+        }
+    }
+    Some(worst)
+}
+
+fn library_rank(filter: &str, id: &str, title: &str, packs: &[String], author: &str) -> Option<u8> {
+    library_match(filter, id, title, packs, author).map(|(r, _)| r)
+}
+
 fn refresh_library(ui: &AppWindow, k: &Core) {
-    let filter = ui.get_library_filter().to_lowercase();
+    let filter = ui.get_library_filter().trim().to_lowercase();
     let mode = ui.get_library_mode();
+    let sort = ui.get_library_sort();
     let game = k.game_version.as_ref().and_then(|v| v.parse::<Version>().ok()).map(|v| v.major_minor()).unwrap_or_default();
     let res = k.resolution();
     let mut rows = Vec::new();
@@ -365,25 +475,49 @@ fn refresh_library(ui: &AppWindow, k: &Core) {
         let packs = k.state.packs_using(name, None);
         let update = k.updates.get(name).map(|r| r.version.clone()).unwrap_or_default();
         let active = res.mods.contains_key(name);
+        let incompatible = !game.is_empty() && !factorio_compatible(&latest.factorio_version, &game);
         let keep = match mode {
             1 => active,
             2 => packs.is_empty(),
             3 => !update.is_empty(),
+            4 => incompatible,
             _ => true,
         };
         if !keep {
             continue;
         }
         let title = display_title(&latest.title, name);
-        if !filter.is_empty()
-            && !name.to_lowercase().contains(&filter)
-            && !title.to_lowercase().contains(&filter)
-            && !latest.author.to_lowercase().contains(&filter)
-        {
+        let Some((rank, hint)) = library_match(&filter, name, &title, &packs, &latest.author) else {
             continue;
-        }
+        };
+        // Clé de tri (la plus grande en premier) et information affichée sur la ligne.
+        let (key, sort_info) = match sort {
+            1 => {
+                let t = versions
+                    .iter()
+                    .filter_map(|v| fs::metadata(&v.path).and_then(|m| m.modified()).ok())
+                    .max()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                (t, if t > 0 { format!("reçu le {}", local_date(t)) } else { String::new() })
+            }
+            2 => {
+                let size: u64 = versions.iter().map(|v| file_size(&v.path)).sum();
+                (size as i64, human_size(size))
+            }
+            3 => {
+                let t = portal_summary(k, name)
+                    .and_then(|m| m.latest_release.as_ref())
+                    .and_then(|r| chrono::DateTime::parse_from_rfc3339(&r.released_at).ok())
+                    .map(|d| d.timestamp())
+                    .unwrap_or(0);
+                (t, if t > 0 { format!("MàJ le {}", local_date(t)) } else { String::new() })
+            }
+            _ => (0, String::new()),
+        };
         let icon = load_image(k.icons.get(name));
-        rows.push(ModRow {
+        rows.push((rank, key, ModRow {
             name: name.into(),
             letter: letter(&title),
             title: title.into(),
@@ -394,19 +528,25 @@ fn refresh_library(ui: &AppWindow, k: &Core) {
             versions_count: versions.len() as i32,
             update: update.into(),
             packs: packs.join(", ").into(),
+            hint: hint.into(),
+            sort_info: sort_info.into(),
             active,
-            incompatible: !game.is_empty() && !factorio_compatible(&latest.factorio_version, &game),
+            incompatible,
             checked: k.lib_selection.contains(name),
             downloading: k.pending.contains_key(name),
             progress: k.pending.get(name).map(|p| p.progress).unwrap_or(0.0),
-        });
+        }));
     }
     // Mods pas encore dans le dépôt : affichés grisés pendant leur téléchargement.
     for (name, p) in k.pending.iter().filter(|(n, _)| !k.index.contains_key(*n)) {
-        if !filter.is_empty() && !name.to_lowercase().contains(&filter) && !p.title.to_lowercase().contains(&filter) {
+        let packs = k.state.packs_using(name, None);
+        let Some((rank, hint)) = library_match(&filter, name, &p.title, &packs, "") else {
+            continue;
+        };
+        if mode != 0 {
             continue;
         }
-        rows.push(ModRow {
+        rows.push((rank, 0, ModRow {
             name: name.into(),
             letter: letter(&p.title),
             title: p.title.clone().into(),
@@ -416,16 +556,20 @@ fn refresh_library(ui: &AppWindow, k: &Core) {
             version: p.version.clone().into(),
             versions_count: 0,
             update: "".into(),
-            packs: k.state.packs_using(name, None).join(", ").into(),
+            packs: packs.join(", ").into(),
+            hint: hint.into(),
+            sort_info: "".into(),
             active: false,
             incompatible: false,
             checked: false,
             downloading: true,
             progress: p.progress,
-        });
+        }));
     }
-    rows.sort_by_key(|r| r.title.to_lowercase());
+    rows.sort_by_cached_key(|(rank, key, r)| (*rank, std::cmp::Reverse(*key), r.title.to_lowercase()));
+    let rows: Vec<ModRow> = rows.into_iter().map(|(_, _, r)| r).collect();
     ui.set_library_total(k.index.len() as i32);
+    ui.set_updates_count(k.updates.len() as i32);
     ui.set_lib_selected_count(k.lib_selection.len() as i32);
     ui.set_library(model(rows));
     ui.set_selected_mod(k.selected_mod.clone().unwrap_or_default().into());
@@ -549,7 +693,7 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
     ui.set_pack_factorio_warning(warning.into());
 
     let filter = ui.get_pack_mod_filter().trim().to_lowercase();
-    let rows: Vec<PackModRow> = pack
+    let mut rows: Vec<(u8, PackModRow)> = pack
         .mods
         .iter()
         .enumerate()
@@ -557,13 +701,13 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
             let ver: Version = e.version.parse().unwrap_or_default();
             let info = store::find(&k.index, &e.name, &ver);
             let title = display_title(info.map(|i| i.title.as_str()).unwrap_or(""), &e.name);
-            if !filter.is_empty() && !e.name.to_lowercase().contains(&filter) && !title.to_lowercase().contains(&filter) {
-                return None;
-            }
+            let packs = k.state.packs_using(&e.name, None);
+            let author = info.map(|i| i.author.as_str()).unwrap_or("");
+            let rank = library_rank(&filter, &e.name, &title, &packs, author)?;
             let versions = pack_mod_versions(&k.index, e);
             let idx = versions.iter().position(|v| v == &e.version).unwrap_or(0);
             let icon = load_image(k.icons.get(&e.name));
-            Some(PackModRow {
+            Some((rank, PackModRow {
                 // Position dans le modpack (la liste affichée peut être filtrée).
                 index: pos as i32,
                 name: e.name.clone().into(),
@@ -574,14 +718,21 @@ fn refresh_pack_detail(ui: &AppWindow, k: &Core, reset_meta: bool) {
                 versions: strings(versions),
                 version_index: idx as i32,
                 enabled: e.enabled,
+                pinned: e.pinned,
                 missing: info.is_none() && !k.pending.contains_key(&e.name),
                 downloading: k.pending.contains_key(&e.name),
                 progress: k.pending.get(&e.name).map(|p| p.progress).unwrap_or(0.0),
-            })
+            }))
         })
         .collect();
+    // Tri stable : sans filtre, l'ordre du modpack est conservé.
+    rows.sort_by_key(|(rank, _)| *rank);
+    let rows: Vec<PackModRow> = rows.into_iter().map(|(_, r)| r).collect();
     ui.set_pack_mods_total(pack.mods.len() as i32);
     ui.set_pack_mods(model(rows));
+    ui.set_pack_undo_label(
+        pack.history.last().map(|h| format!("Revenir à l'état d'avant le {}", h.at)).unwrap_or_default().into(),
+    );
 
     let builtins: Vec<BuiltinRow> = k
         .builtins
@@ -709,6 +860,113 @@ fn refresh_settings(ui: &AppWindow, k: &Core) {
 // Opérations de fond
 // ---------------------------------------------------------------------------
 
+/// `version` est-elle la plus récente du dépôt pour ce mod ?
+fn is_latest(index: &Index, name: &str, version: &Version) -> bool {
+    index.get(name).and_then(|v| v.first()).map(|m| m.version <= *version).unwrap_or(true)
+}
+
+/// Fait passer les modpacks à la dernière version du dépôt des mods `names`, sauf là où une
+/// version a été choisie à la main ou si cette version ne convient pas à la version de Factorio
+/// visée par le modpack. Renvoie le nombre de mods mis à jour dans les modpacks.
+fn follow_latest(k: &mut Core, names: &HashSet<String>) -> usize {
+    let targets: Vec<String> = k.state.packs.iter().map(|p| k.target_factorio(Some(p))).collect();
+    let mut n = 0;
+    for (pack, target) in k.state.packs.iter_mut().zip(targets) {
+        for e in pack.mods.iter_mut().filter(|e| !e.pinned && names.contains(&e.name)) {
+            let Some(latest) = k.index.get(&e.name).and_then(|v| v.first()) else { continue };
+            let current: Version = e.version.parse().unwrap_or_default();
+            if latest.version > current && (target.is_empty() || factorio_compatible(&latest.factorio_version, &target)) {
+                e.version = latest.version.to_string();
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Après une mise à jour : ajoute aux modpacks les dépendances obligatoires apparues (ou met à jour
+/// celles dont la version ne convient plus), ainsi que les dépendances optionnelles choisies
+/// (`optional` : mod mis à jour -> dépendances à ajouter). Seuls les modpacks qui utilisent la
+/// version mise à jour sont concernés. Renvoie (ajoutées, mises à jour).
+fn ensure_pack_deps(
+    k: &mut Core,
+    updated_to: &HashMap<String, Version>,
+    optional: &HashMap<String, Vec<String>>,
+    scope: Option<&str>,
+) -> (usize, usize) {
+    let index = k.index.clone();
+    let builtins = k.builtins.clone();
+    let targets: Vec<String> = k.state.packs.iter().map(|p| k.target_factorio(Some(p))).collect();
+    let required = |info: &store::ModInfo| info.deps().into_iter().filter(|d| d.kind.is_required()).collect::<Vec<_>>();
+    let (mut added, mut updated) = (0, 0);
+    for (pack, target) in k.state.packs.iter_mut().zip(targets) {
+        if scope.is_some_and(|id| id != pack.id) {
+            continue;
+        }
+        let mut stack: Vec<Dependency> = Vec::new();
+        // Seuls les mods passés à la nouvelle version (pas ceux restés sur une version fixée).
+        for e in pack.mods.iter().filter(|e| e.enabled) {
+            let v: Version = e.version.parse().unwrap_or_default();
+            if updated_to.get(&e.name) != Some(&v) {
+                continue;
+            }
+            let Some(info) = store::find(&index, &e.name, &v) else { continue };
+            stack.extend(required(info));
+            for o in optional.get(&e.name).into_iter().flatten() {
+                stack.extend(info.deps().into_iter().filter(|d| &d.name == o));
+            }
+        }
+        let mut seen = HashSet::new();
+        while let Some(dep) = stack.pop() {
+            if is_builtin(&dep.name, &builtins) || !seen.insert(dep.name.clone()) {
+                continue;
+            }
+            match pack.mods.iter_mut().find(|e| e.name == dep.name) {
+                Some(e) => {
+                    let cur: Version = e.version.parse().unwrap_or_default();
+                    if dep.matches(&cur) || e.pinned {
+                        if let Some(i) = store::find(&index, &dep.name, &cur) {
+                            stack.extend(required(i));
+                        }
+                    } else if let Some(m) = installed_compatible(&index, &dep, &target) {
+                        e.version = m.version.to_string();
+                        updated += 1;
+                        stack.extend(required(m));
+                    }
+                }
+                None => {
+                    if let Some(m) = installed_compatible(&index, &dep, &target) {
+                        pack.set_mod(&m.name, &m.version);
+                        added += 1;
+                        stack.extend(required(m));
+                    }
+                }
+            }
+        }
+    }
+    (added, updated)
+}
+
+/// Mods de chaque modpack, pour mémoriser l'état d'avant une mise à jour.
+fn packs_snapshot(k: &Core) -> Vec<(String, Vec<PackEntry>)> {
+    k.state.packs.iter().map(|p| (p.id.clone(), p.mods.clone())).collect()
+}
+
+/// Ajoute à l'historique des modpacks modifiés depuis `before` leur état précédent.
+fn record_history(k: &mut Core, before: Vec<(String, Vec<PackEntry>)>) -> usize {
+    let at = now_label();
+    let mut n = 0;
+    for (id, mods) in before {
+        if let Some(p) = k.state.pack_mut(&id) {
+            if p.mods != mods {
+                p.push_history(mods, at.clone());
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Ajoute une version d'un mod au modpack, avec ses dépendances obligatoires déjà présentes
 /// dans le dépôt. Renvoie le nombre de dépendances ajoutées.
 fn add_mod_to_pack(k: &mut Core, pack_id: &str, info: &store::ModInfo) -> usize {
@@ -716,6 +974,7 @@ fn add_mod_to_pack(k: &mut Core, pack_id: &str, info: &store::ModInfo) -> usize 
     let index = k.index.clone();
     let Some(pack) = k.state.pack_mut(pack_id) else { return 0 };
     pack.set_mod(&info.name, &info.version);
+    pack.set_pinned(&info.name, !is_latest(&index, &info.name, &info.version));
     let mut added = 0;
     let mut stack = info.deps();
     let mut seen = HashSet::new();
@@ -743,22 +1002,29 @@ fn pack_add_rows(k: &Core, query: &str) -> Vec<AddRow> {
     }
     let pack = k.selected_pack.as_ref().and_then(|id| k.state.pack(id));
     let in_pack = |n: &str| pack.map(|p| p.entry(n).is_some()).unwrap_or(false);
-    let mut rows = Vec::new();
+    let mut local: Vec<(u8, String, AddRow)> = Vec::new();
     for (name, versions) in &k.index {
-        if rows.len() >= 8 {
-            break;
-        }
-        let title = display_title(&versions[0].title, name);
-        if in_pack(name) || !(name.to_lowercase().contains(&q) || title.to_lowercase().contains(&q)) {
+        if in_pack(name) {
             continue;
         }
-        rows.push(AddRow {
-            name: name.into(),
-            title: title.into(),
-            info: format!("Dans le dépôt  •  {}", versions[0].version).into(),
-            installed: true,
-        });
+        let title = display_title(&versions[0].title, name);
+        let packs = k.state.packs_using(name, None);
+        let Some(rank) = library_rank(&q, name, &title, &packs, &versions[0].author) else {
+            continue;
+        };
+        local.push((
+            rank,
+            title.to_lowercase(),
+            AddRow {
+                name: name.into(),
+                title: title.into(),
+                info: format!("Dans le dépôt  •  {}", versions[0].version).into(),
+                installed: true,
+            },
+        ));
     }
+    local.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let mut rows: Vec<AddRow> = local.into_iter().take(8).map(|(_, _, r)| r).collect();
     if let Some(list) = &k.portal_list {
         let target = k.target_factorio(pack);
         let filter = (!target.is_empty()).then_some(target.as_str());
@@ -1292,6 +1558,9 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
                 for (n, v, _) in &wanted {
                     p.set_mod(n, v);
                 }
+                // Version plus ancienne que la meilleure disponible : choix manuel, figé.
+                let best = dl.releases.iter().filter(|r| factorio_compatible(&r.factorio(), &target)).map(|r| r.ver()).max();
+                p.set_pinned(&dl.name, best.is_some_and(|b| main.ver() < b));
                 if msg.is_empty() {
                     msg.push_str(&format!(", ajouté(s) à « {} »", p.name));
                 }
@@ -1322,6 +1591,20 @@ fn confirm_download(c: &Shared, w: &Weak<AppWindow>, target_pack: Option<String>
     let core = &mut *k;
     let index = &core.index;
     core.updates.retain(|name, r| index.get(name).map(|v| r.ver() > v[0].version).unwrap_or(true));
+    let names: HashSet<String> =
+        jobs.iter().map(|(n, _)| n.clone()).filter(|n| !failed.iter().any(|f| f.starts_with(&format!("{n} (")))).collect();
+    let before = packs_snapshot(&k);
+    let followed = follow_latest(&mut k, &names);
+    let latest: HashMap<String, Version> =
+        names.iter().filter_map(|n| k.index.get(n).map(|v| (n.clone(), v[0].version))).collect();
+    let (added, updated) = ensure_pack_deps(&mut k, &latest, &HashMap::new(), None);
+    record_history(&mut k, before);
+    if followed > 0 {
+        out.push_str(&format!(", {followed} mise(s) à jour dans les modpacks"));
+    }
+    if added + updated > 0 {
+        out.push_str(&format!(" (dépendances : {added} ajoutée(s), {updated} mise(s) à jour)"));
+    }
     k.save_state();
     Ok(out + ".")
 }
@@ -1364,6 +1647,7 @@ fn download_jobs(
                     k.pending.remove(&name);
                     match result {
                         Ok(info) => {
+                            journal::log(format!("Téléchargé : {} {}", info.name, info.version));
                             if let Some(p) = icon {
                                 k.icons.insert(info.name.clone(), p);
                             }
@@ -1372,7 +1656,10 @@ fn download_jobs(
                             list.push(info);
                             list.sort_by(|a, b| b.version.cmp(&a.version));
                         }
-                        Err(e) => failed.lock().unwrap().push(format!("{name} ({e})")),
+                        Err(e) => {
+                            journal::log(format!("Échec du téléchargement de {name} {} : {e:#}", rel.version));
+                            failed.lock().unwrap().push(format!("{name} ({e})"));
+                        }
                     }
                 }
                 let n = done.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1407,6 +1694,393 @@ fn post_mod_progress(w: &Weak<AppWindow>, c: &Shared, name: &str, progress: f32)
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Mises à jour (tous les mods, ou un modpack) avec changelog et nouvelles dépendances
+// ---------------------------------------------------------------------------
+
+fn refresh_upd(ui: &AppWindow, k: &Core) {
+    let Some(u) = &k.upd else {
+        ui.set_upd_visible(false);
+        return;
+    };
+    let rows: Vec<UpdRow> = u
+        .items
+        .iter()
+        .map(|i| UpdRow {
+            name: i.name.clone().into(),
+            title: i.title.clone().into(),
+            from: i.from.to_string().into(),
+            to: i.to.to_string().into(),
+            source: if i.release.is_some() { "à télécharger" } else { "déjà dans le dépôt" }.into(),
+            changelog: i.changelog.clone().into(),
+            checked: i.checked,
+        })
+        .collect();
+    let opts: Vec<UpdOptRow> = u
+        .opts
+        .iter()
+        .map(|o| UpdOptRow {
+            name: o.name.clone().into(),
+            info: format!(
+                "{} • ajoutée par {}",
+                o.status,
+                o.for_mods.join(", ")
+            )
+            .into(),
+            required: o.required,
+            checked: o.checked,
+            checkable: o.checkable,
+        })
+        .collect();
+    let n = u.items.iter().filter(|i| i.checked).count();
+    ui.set_upd_rows(model(rows));
+    ui.set_upd_opts(model(opts));
+    ui.set_upd_count(n as i32);
+}
+
+/// Ouvre la fenêtre des mises à jour : tous les mods (`pack` = None) ou les mods d'un modpack.
+fn open_updates(ui: &AppWindow, core: &Shared, only: Option<Vec<String>>, pack: Option<String>) {
+    let (items, portal) = {
+        let k = core.lock().unwrap();
+        let mut items: Vec<UpdItem> = Vec::new();
+        match &pack {
+            None => {
+                for (name, rel) in &k.updates {
+                    if only.as_ref().is_some_and(|o| !o.contains(name)) {
+                        continue;
+                    }
+                    let Some(local) = k.index.get(name) else { continue };
+                    items.push(UpdItem {
+                        name: name.clone(),
+                        title: display_title(&local[0].title, name),
+                        from: local[0].version,
+                        to: rel.ver(),
+                        release: Some(rel.clone()),
+                        changelog: String::new(),
+                        checked: true,
+                    });
+                }
+            }
+            Some(id) => {
+                let Some(p) = k.state.pack(id) else { return };
+                let target = k.target_factorio(Some(p));
+                for e in p.mods.iter().filter(|e| !e.pinned) {
+                    let cur: Version = e.version.parse().unwrap_or_default();
+                    let repo = k
+                        .index
+                        .get(&e.name)
+                        .and_then(|v| v.iter().find(|m| factorio_compatible(&m.factorio_version, &target)));
+                    let portal_rel = k.updates.get(&e.name).filter(|r| factorio_compatible(&r.factorio(), &target));
+                    let (to, release) = match (repo, portal_rel) {
+                        (_, Some(r)) if repo.is_none_or(|m| r.ver() > m.version) => (r.ver(), Some(r.clone())),
+                        (Some(m), _) => (m.version, None),
+                        _ => continue,
+                    };
+                    if to <= cur {
+                        continue;
+                    }
+                    let title = k.index.get(&e.name).map(|v| display_title(&v[0].title, &e.name)).unwrap_or(e.name.clone());
+                    items.push(UpdItem {
+                        name: e.name.clone(),
+                        title,
+                        from: cur,
+                        to,
+                        release,
+                        changelog: String::new(),
+                        checked: true,
+                    });
+                }
+            }
+        }
+        (items, k.portal.clone())
+    };
+    let pack_name = pack.as_ref().and_then(|id| core.lock().unwrap().state.pack(id).map(|p| p.name.clone()));
+    if items.is_empty() {
+        ui.set_status(match &pack_name {
+            Some(n) => format!("« {n} » est déjà à jour (les versions fixées à la main ne sont pas proposées)."),
+            None => "Aucune mise à jour à installer : lance d'abord une vérification.".to_string(),
+        }
+        .into());
+        return;
+    }
+    ui.set_upd_title(
+        match &pack_name {
+            Some(n) => format!("Mettre à jour « {n} »"),
+            None => format!("Mises à jour des mods ({})", items.len()),
+        }
+        .into(),
+    );
+    ui.set_upd_loading(true);
+    ui.set_upd_visible(true);
+    {
+        let mut k = core.lock().unwrap();
+        k.upd = Some(UpdSession { items: items.clone(), opts: vec![], pack: pack.clone() });
+        refresh_upd(ui, &k);
+    }
+    let (c, w) = (core.clone(), ui.as_weak());
+    std::thread::spawn(move || {
+        let (index, builtins, target) = {
+            let k = c.lock().unwrap();
+            let p = pack.as_ref().and_then(|id| k.state.pack(id));
+            (k.index.clone(), k.builtins.clone(), k.target_factorio(p))
+        };
+        let names: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
+        let fulls: HashMap<String, portal::ModFull> =
+            parallel_map(&names, 8, |n| portal.full(n).ok().map(|f| (n.clone(), f))).into_iter().collect();
+        let mut items = items;
+        let mut opts: Vec<UpdOpt> = Vec::new();
+        for it in items.iter_mut() {
+            let full = fulls.get(&it.name);
+            it.changelog = match full.and_then(|f| f.changelog.as_deref()) {
+                Some(text) => {
+                    let log = portal::changelog_since(text, &it.from);
+                    if log.is_empty() { "Le changelog ne décrit pas ces versions.".into() } else { short_block(&log, 3000) }
+                }
+                None if full.is_some() => "Pas de changelog sur le portail.".into(),
+                None => "Changelog indisponible (portail injoignable).".into(),
+            };
+            // Dépendances de la nouvelle version absentes de l'ancienne.
+            let new_deps: Vec<Dependency> = match &it.release {
+                Some(r) => r.deps(),
+                None => store::find(&index, &it.name, &it.to).map(|m| m.deps()).unwrap_or_default(),
+            };
+            let old: HashSet<String> = store::find(&index, &it.name, &it.from)
+                .map(|m| m.deps().into_iter().map(|d| d.name).collect())
+                .unwrap_or_default();
+            for d in new_deps {
+                if is_builtin(&d.name, &builtins) || old.contains(&d.name) || d.kind == DepKind::Incompatible {
+                    continue;
+                }
+                if !d.kind.is_required() && !d.kind.is_optional_like() {
+                    continue;
+                }
+                if let Some(o) = opts.iter_mut().find(|o| o.name == d.name) {
+                    o.for_mods.push(it.title.clone());
+                    o.required |= d.kind.is_required();
+                    continue;
+                }
+                let mut o = UpdOpt {
+                    name: d.name.clone(),
+                    for_mods: vec![it.title.clone()],
+                    required: d.kind.is_required(),
+                    release: None,
+                    installed: None,
+                    checked: d.kind.is_required(),
+                    checkable: !d.kind.is_required(),
+                    status: String::new(),
+                };
+                if let Some(m) = installed_compatible(&index, &d, &target) {
+                    o.installed = Some(m.version);
+                    o.status = format!("{} {}, déjà dans le dépôt", d.kind.label(), m.version);
+                } else {
+                    match portal.full(&d.name).ok().and_then(|f| f.best_release(&target, Some(&d))) {
+                        Some(r) => {
+                            o.status = format!("{}, à télécharger : {}", d.kind.label(), r.version);
+                            o.release = Some(r);
+                        }
+                        None => {
+                            o.checked = false;
+                            o.checkable = false;
+                            o.status = format!("⚠ {} sans version pour Factorio {target}", d.kind.label());
+                        }
+                    }
+                }
+                opts.push(o);
+            }
+        }
+        opts.sort_by_key(|o| (!o.required, o.name.to_lowercase()));
+        let _ = w.upgrade_in_event_loop(move |ui| {
+            let mut k = c.lock().unwrap();
+            if let Some(u) = k.upd.as_mut() {
+                // Conserve les cases décochées entre-temps.
+                for it in items.iter_mut() {
+                    if let Some(old) = u.items.iter().find(|o| o.name == it.name) {
+                        it.checked = old.checked;
+                    }
+                }
+                u.items = items;
+                u.opts = opts;
+            }
+            ui.set_upd_loading(false);
+            refresh_upd(&ui, &k);
+        });
+    });
+}
+
+/// Texte tronqué à `max` caractères (fin de ligne conservée).
+fn short_block(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    format!("{}\n…", s.chars().take(max).collect::<String>())
+}
+
+/// Installe les mises à jour cochées : téléchargements (avec les nouvelles dépendances), puis
+/// passage des modpacks aux nouvelles versions. L'état précédent de chaque modpack modifié est
+/// mémorisé pour pouvoir y revenir.
+fn run_updates(c: &Shared, w: &Weak<AppWindow>, session: UpdSession) -> Result<String> {
+    let (portal, index, builtins, target, creds, downloads, store) = {
+        let k = c.lock().unwrap();
+        let p = session.pack.as_ref().and_then(|id| k.state.pack(id));
+        (
+            k.portal.clone(),
+            k.index.clone(),
+            k.builtins.clone(),
+            k.target_factorio(p),
+            k.credentials(),
+            k.paths.downloads.clone(),
+            k.store.clone(),
+        )
+    };
+    let items: Vec<&UpdItem> = session.items.iter().filter(|i| i.checked).collect();
+    if items.is_empty() {
+        return Ok("Aucune mise à jour sélectionnée.".into());
+    }
+    let mut seen: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
+    let mut jobs: Vec<(String, Release)> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut add_closure = |name: &str, deps: Vec<Dependency>, jobs: &mut Vec<(String, Release)>, seen: &mut HashSet<String>| {
+        for e in required_closure(&portal, &index, &builtins, &target, name, deps, seen) {
+            match (e.release, e.installed) {
+                (Some(r), _) => jobs.push((e.name, r)),
+                (None, Some(_)) => {}
+                (None, None) => skipped.push(e.name),
+            }
+        }
+    };
+    for it in &items {
+        let deps = match &it.release {
+            Some(r) => {
+                jobs.push((it.name.clone(), r.clone()));
+                r.deps()
+            }
+            None => store::find(&index, &it.name, &it.to).map(|m| m.deps()).unwrap_or_default(),
+        };
+        add_closure(&it.name, deps, &mut jobs, &mut seen);
+    }
+    let mut optional: HashMap<String, Vec<String>> = HashMap::new();
+    for o in session.opts.iter().filter(|o| o.checked && !o.required) {
+        for it in items.iter().filter(|i| o.for_mods.contains(&i.title)) {
+            optional.entry(it.name.clone()).or_default().push(o.name.clone());
+        }
+        if o.installed.is_none() && seen.insert(o.name.clone()) {
+            if let Some(r) = &o.release {
+                jobs.push((o.name.clone(), r.clone()));
+                add_closure(&o.name, r.deps(), &mut jobs, &mut seen);
+            }
+        }
+    }
+    let creds = if jobs.is_empty() {
+        None
+    } else {
+        Some(creds.ok_or_else(|| {
+            anyhow!("identifiants du portail introuvables : connecte-toi au portail dans Factorio ou renseigne-les dans Paramètres")
+        })?)
+    };
+    {
+        let mut k = c.lock().unwrap();
+        for (name, rel) in &jobs {
+            let title = k.index.get(name).map(|v| display_title(&v[0].title, name)).unwrap_or(name.clone());
+            k.pending.insert(name.clone(), Pending { version: rel.version.clone(), title, progress: 0.0 });
+        }
+    }
+    post_refresh(w, c);
+    let failed = download_jobs(c, w, &portal, &store, &downloads, creds, jobs.clone());
+
+    let mut k = c.lock().unwrap();
+    let failed_names: HashSet<String> =
+        jobs.iter().map(|(n, _)| n.clone()).filter(|n| failed.iter().any(|f| f.starts_with(&format!("{n} (")))).collect();
+    let names: HashSet<String> = items.iter().map(|i| i.name.clone()).filter(|n| !failed_names.contains(n)).collect();
+    let before = packs_snapshot(&k);
+    let moved = match &session.pack {
+        None => follow_latest(&mut k, &names),
+        Some(id) => {
+            let index = k.index.clone();
+            let mut n = 0;
+            if let Some(p) = k.state.pack_mut(id) {
+                for it in items.iter().filter(|i| names.contains(&i.name)) {
+                    if store::find(&index, &it.name, &it.to).is_some() {
+                        if let Some(e) = p.mods.iter_mut().find(|e| e.name == it.name) {
+                            e.version = it.to.to_string();
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            n
+        }
+    };
+    let updated_to: HashMap<String, Version> =
+        items.iter().filter(|i| names.contains(&i.name)).map(|i| (i.name.clone(), i.to)).collect();
+    let (added, updated) = ensure_pack_deps(&mut k, &updated_to, &optional, session.pack.as_deref());
+    let changed_packs = record_history(&mut k, before);
+    let core = &mut *k;
+    let index = &core.index;
+    core.updates.retain(|name, r| index.get(name).map(|v| r.ver() > v[0].version).unwrap_or(true));
+    k.save_state();
+    let mut out = format!("{} mod(s) mis à jour", names.len());
+    if moved > 0 {
+        out.push_str(&format!(", {moved} changement(s) de version dans {changed_packs} modpack(s)"));
+    }
+    if added + updated > 0 {
+        out.push_str(&format!(", dépendances : {added} ajoutée(s), {updated} mise(s) à jour"));
+    }
+    if !failed.is_empty() {
+        out.push_str(&format!(" — échecs : {}", failed.join(", ")));
+    }
+    if !skipped.is_empty() {
+        out.push_str(&format!(" — sans version pour Factorio {target} : {}", skipped.join(", ")));
+    }
+    journal::log(&out);
+    Ok(out + ".")
+}
+
+/// Anciennes versions qu'aucun modpack n'utilise (ni son historique, ni un choix de conflit).
+/// La version la plus récente de chaque mod est toujours conservée.
+fn cleanable_versions(k: &Core) -> Vec<store::ModInfo> {
+    let mut used: HashSet<(String, String)> = HashSet::new();
+    for p in &k.state.packs {
+        for e in p.mods.iter().chain(p.history.iter().flat_map(|h| h.mods.iter())) {
+            used.insert((e.name.clone(), e.version.parse::<Version>().map(|v| v.to_string()).unwrap_or(e.version.clone())));
+        }
+    }
+    for (n, v) in k.state.conflict_choices.iter().chain(k.session_choices.iter()) {
+        used.insert((n.clone(), v.clone()));
+    }
+    k.index
+        .values()
+        .flat_map(|versions| versions.iter().skip(1))
+        .filter(|m| !used.contains(&(m.name.clone(), m.version.to_string())))
+        .cloned()
+        .collect()
+}
+
+/// Fichier déposé sur la fenêtre : zip de mod (copié dans le dépôt) ou modpack `.fmpack`.
+fn handle_drop(ui: &AppWindow, core: &Shared, path: PathBuf) {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    match ext.as_str() {
+        "zip" => task(ui, core, &format!("Ajout de {name} au dépôt…"), move |c, _| {
+            let store = c.lock().unwrap().store.clone();
+            let info = store.add_file(&path, AddMode::LinkOrCopy)?;
+            {
+                let mut k = c.lock().unwrap();
+                if let Some(p) = store.icon(&info) {
+                    k.icons.insert(info.name.clone(), p);
+                }
+                let list = k.index.entry(info.name.clone()).or_default();
+                list.retain(|m| m.version != info.version);
+                list.push(info.clone());
+                list.sort_by(|a, b| b.version.cmp(&a.version));
+            }
+            fetch_missing_icons(c);
+            Ok(format!("{} {} ajouté au dépôt.", info.name, info.version))
+        }),
+        "fmpack" => task(ui, core, &format!("Import du modpack {name}…"), move |c, w| import_pack(c, w, &path)),
+        _ => ui.set_status(format!("{name} ignoré : dépose un zip de mod ou un fichier .fmpack.").into()),
+    }
 }
 
 fn import_existing(c: &Shared, w: &Weak<AppWindow>) -> Result<String> {
@@ -2025,6 +2699,8 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
     };
+    journal::init(paths.data.join("journal.log"));
+    journal::log(format!("Démarrage de Factorio Mod Manager v{}", env!("CARGO_PKG_VERSION")));
     let mut config = Config::load(&paths.data.join("config.json"));
     if config.factorio_user_dir.is_none() {
         config.factorio_user_dir = factorio::default_user_dir().filter(|d| d.exists());
@@ -2068,6 +2744,7 @@ pub fn run() -> Result<()> {
         failure: None,
         game_running: false,
         pending_missing: HashMap::new(),
+        upd: None,
     };
     core.check_dirs = CheckDirs::new(core.paths.data.join("check"));
     core.refresh_factorio();
@@ -2092,6 +2769,28 @@ pub fn run() -> Result<()> {
     wire_packs(&ui, &core);
     wire_dialogs(&ui, &core);
     wire_settings(&ui, &core);
+    wire_updates(&ui, &core);
+    wire_journal(&ui, &core);
+
+    // Glisser-déposer de fichiers sur la fenêtre (événement winit, une fois la fenêtre créée).
+    {
+        let (c, w) = (core.clone(), ui.as_weak());
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            use slint::winit_030::{EventResult, WinitWindowAccessor, winit::event::WindowEvent};
+            let Some(ui) = w.upgrade() else { return };
+            let w2 = w.clone();
+            ui.window().on_winit_window_event(move |_, ev| {
+                if let WindowEvent::DroppedFile(p) = ev {
+                    if let Some(ui) = w2.upgrade() {
+                        handle_drop(&ui, &c, p.clone());
+                    }
+                }
+                EventResult::Propagate
+            });
+        });
+    }
+    #[cfg(windows)]
+    let _tray = tray::setup(&ui, &core);
 
     task(&ui, &core, "Analyse du dépôt…", |c, w| {
         rescan(c);
@@ -2314,8 +3013,48 @@ fn wire_library(ui: &AppWindow, core: &Shared) {
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_download_update(move |name| {
         let ui = w.unwrap();
-        let preset = c.lock().unwrap().updates.get(name.as_str()).map(|r| r.version.clone());
-        open_download(&ui, &c, name.to_string(), preset, DlTarget::NoPack, true);
+        open_updates(&ui, &c, Some(vec![name.to_string()]), None);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_update_all(move || {
+        let ui = w.unwrap();
+        open_updates(&ui, &c, None, None);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_close_detail(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        k.selected_mod = None;
+        if !ui.get_dl_visible() {
+            k.dl = None;
+        }
+        refresh_detail(&ui, &k);
+        ui.set_selected_mod("".into());
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_clean_repo(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let list = cleanable_versions(&k);
+        if list.is_empty() {
+            ui.set_status("Rien à nettoyer : chaque ancienne version est utilisée par un modpack.".into());
+            return;
+        }
+        let total: u64 = list.iter().map(|m| file_size(&m.path)).sum();
+        let mut text = format!(
+            "{} ancienne(s) version(s) ne sont utilisées par aucun modpack (ni par leur historique). \
+             La version la plus récente de chaque mod est conservée.\n\nPlace libérée : {}\n\n",
+            list.len(),
+            human_size(total)
+        );
+        for m in &list {
+            text.push_str(&format!("  - {} {}  ({})\n", m.name, m.version, human_size(file_size(&m.path))));
+        }
+        ui.set_confirm_title(format!("Libérer {} dans le dépôt ?", human_size(total)).into());
+        ui.set_confirm_text(text.into());
+        ui.set_confirm_ok("Nettoyer".into());
+        ui.set_confirm_visible(true);
+        k.confirm = Some(Confirm::CleanRepo(list));
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_delete_version(move |name, version| {
@@ -2333,9 +3072,11 @@ fn wire_library(ui: &AppWindow, core: &Shared) {
         let ui = w.unwrap();
         let mut k = c.lock().unwrap();
         let mut n = 0;
+        let pinned = !is_latest(&k.index, &name, &version.parse().unwrap_or_default());
         for p in k.state.packs.iter_mut() {
             if let Some(e) = p.mods.iter_mut().find(|e| e.name == name.as_str()) {
                 e.version = version.to_string();
+                e.pinned = pinned;
                 n += 1;
             }
         }
@@ -2633,6 +3374,7 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
         if let Some(e) = k.state.pack_mut(&id).and_then(|p| p.mods.get_mut(i as usize)) {
             if let Some(v) = pack_mod_versions(&index, e).get(vi.max(0) as usize) {
                 e.version = v.clone();
+                e.pinned = !is_latest(&index, &e.name, &v.parse().unwrap_or_default());
             }
         }
         k.save_state();
@@ -2784,6 +3526,26 @@ fn wire_packs(ui: &AppWindow, core: &Shared) {
             transfer::export(&pack, &dest, &index, settings.as_deref(), include)?;
             Ok(format!("Modpack exporté vers {}.", dest.display()))
         });
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_pack_update(move || {
+        let ui = w.unwrap();
+        let id = c.lock().unwrap().selected_pack.clone();
+        if let Some(id) = id {
+            open_updates(&ui, &c, None, Some(id));
+        }
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_pack_undo(move || {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        let Some(id) = k.selected_pack.clone() else { return };
+        let Some((at, name)) = k.state.pack_mut(&id).and_then(|p| p.undo().map(|at| (at, p.name.clone()))) else { return };
+        k.save_state();
+        refresh_all(&ui, &k);
+        let msg = format!("« {name} » est revenu à son état d'avant la mise à jour du {at}.");
+        journal::log(&msg);
+        ui.set_status(msg.into());
     });
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_import_pack(move || {
@@ -2995,12 +3757,34 @@ fn wire_dialogs(ui: &AppWindow, core: &Shared) {
                 task(&ui, &c, "Synchronisation du dossier mods/…", move |c, _| {
                     let mods_dir = c.lock().unwrap().config.mods_dir().ok_or_else(|| anyhow!("dossier non configuré"))?;
                     sync::apply(&mods_dir, &plan, settings.as_deref())?;
-                    Ok(format!(
-                        "Factorio synchronisé : +{} / -{} mod(s). Sauvegarde : mod-list.json.fmm-backup",
-                        plan.add.len(),
-                        plan.remove.len()
-                    ))
+                    journal::log(format!("Synchronisation de {} :\n{}", mods_dir.display(), plan.summary()));
+                    let backup = if settings.is_some() { "mod-list.json et mod-settings.dat (.fmm-backup)" } else { "mod-list.json.fmm-backup" };
+                    Ok(format!("Factorio synchronisé : +{} / -{} mod(s). Sauvegarde : {backup}", plan.add.len(), plan.remove.len()))
                 });
+            }
+            Some(Confirm::CleanRepo(list)) => {
+                let mut k = c.lock().unwrap();
+                let (mut freed, mut n) = (0u64, 0);
+                let mut errors = Vec::new();
+                for m in &list {
+                    let size = file_size(&m.path);
+                    match k.store.remove(m) {
+                        Ok(()) => {
+                            freed += size;
+                            n += 1;
+                            if let Some(v) = k.index.get_mut(&m.name) {
+                                v.retain(|x| x.version != m.version);
+                            }
+                        }
+                        Err(e) => errors.push(format!("{} {} ({e})", m.name, m.version)),
+                    }
+                }
+                refresh_all(&ui, &k);
+                let mut msg = format!("Dépôt nettoyé : {n} version(s) supprimée(s), {} libéré(s).", human_size(freed));
+                if !errors.is_empty() {
+                    msg.push_str(&format!(" Erreurs : {}", errors.join(", ")));
+                }
+                ui.set_status(msg.into());
             }
             Some(Confirm::DeletePack(id)) => {
                 let mut k = c.lock().unwrap();
@@ -3145,6 +3929,132 @@ fn wire_dialogs(ui: &AppWindow, core: &Shared) {
     });
 }
 
+fn wire_updates(ui: &AppWindow, core: &Shared) {
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_upd_toggle(move |i, on| {
+        let ui = w.unwrap();
+        let mut k = c.lock().unwrap();
+        if let Some(it) = k.upd.as_mut().and_then(|u| u.items.get_mut(i as usize)) {
+            it.checked = on;
+        }
+        let n = k.upd.as_ref().map(|u| u.items.iter().filter(|i| i.checked).count()).unwrap_or(0);
+        ui.set_upd_count(n as i32);
+    });
+    let c = core.clone();
+    ui.on_upd_opt_toggle(move |i, on| {
+        let mut k = c.lock().unwrap();
+        if let Some(o) = k.upd.as_mut().and_then(|u| u.opts.get_mut(i as usize)).filter(|o| o.checkable) {
+            o.checked = on;
+        }
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_upd_cancel(move || {
+        let ui = w.unwrap();
+        c.lock().unwrap().upd = None;
+        ui.set_upd_visible(false);
+    });
+    let (c, w) = (core.clone(), ui.as_weak());
+    ui.on_upd_confirm(move || {
+        let ui = w.unwrap();
+        let Some(session) = c.lock().unwrap().upd.take() else { return };
+        ui.set_upd_visible(false);
+        task(&ui, &c, "Installation des mises à jour…", move |c, w| run_updates(c, w, session));
+    });
+}
+
+fn wire_journal(ui: &AppWindow, core: &Shared) {
+    let _ = core;
+    ui.on_status_logged(|s| {
+        // Les messages « en cours… » sont suivis de leur résultat : seul celui-ci est gardé.
+        let s = s.trim();
+        if !s.is_empty() && !s.ends_with('…') && s != "Prêt" && !s.starts_with("Téléchargement : ") {
+            journal::log(s);
+        }
+    });
+    let w = ui.as_weak();
+    ui.on_journal_refresh(move || {
+        let ui = w.unwrap();
+        let text = journal::tail(800);
+        ui.set_journal_text(if text.is_empty() { "Le journal est vide.".into() } else { text.into() });
+    });
+    ui.on_journal_open_file(|| {
+        if let Some(p) = journal::path() {
+            let _ = open::that(p);
+        }
+    });
+    let w = ui.as_weak();
+    ui.on_journal_clear(move || {
+        journal::clear();
+        let ui = w.unwrap();
+        ui.invoke_journal_refresh();
+    });
+}
+
+/// Icône dans la zone de notification (Windows) : lancer le jeu avec les modpacks actifs, afficher
+/// la fenêtre, quitter.
+#[cfg(windows)]
+mod tray {
+    use super::{AppWindow, Shared, instance};
+    use slint::ComponentHandle;
+    use std::time::Duration;
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+    use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+    pub struct Tray {
+        _icon: TrayIcon,
+        _timer: slint::Timer,
+    }
+
+    pub fn setup(ui: &AppWindow, core: &Shared) -> Option<Tray> {
+        let img = image::load_from_memory(include_bytes!("../ui/icon.png")).ok()?.thumbnail(32, 32).into_rgba8();
+        let (w, h) = img.dimensions();
+        let icon = tray_icon::Icon::from_rgba(img.into_raw(), w, h).ok()?;
+        let launch = MenuItem::new("Lancer Factorio", true, None);
+        let show = MenuItem::new("Afficher la fenêtre", true, None);
+        let quit = MenuItem::new("Quitter", true, None);
+        let menu = Menu::new();
+        menu.append_items(&[&launch, &show, &quit]).ok()?;
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("Factorio Mod Manager")
+            .with_icon(icon)
+            .build()
+            .ok()?;
+        let (launch_id, show_id, quit_id) = (launch.id().clone(), show.id().clone(), quit.id().clone());
+        let timer = slint::Timer::default();
+        let (c, wk) = (core.clone(), ui.as_weak());
+        let mut label = String::new();
+        timer.start(slint::TimerMode::Repeated, Duration::from_millis(200), move || {
+            let Some(ui) = wk.upgrade() else { return };
+            // Libellé : modpacks qui seront lancés.
+            let want = {
+                let k = c.lock().unwrap();
+                let names: Vec<String> = k.state.active_packs().iter().map(|p| p.name.clone()).collect();
+                if names.is_empty() { "Lancer Factorio".to_string() } else { format!("Lancer Factorio ({})", names.join(", ")) }
+            };
+            if want != label {
+                launch.set_text(&want);
+                label = want;
+            }
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if ev.id == launch_id {
+                    ui.invoke_launch_game();
+                } else if ev.id == show_id {
+                    instance::activate(std::process::id());
+                } else if ev.id == quit_id {
+                    let _ = slint::quit_event_loop();
+                }
+            }
+            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                if let TrayIconEvent::DoubleClick { .. } = ev {
+                    instance::activate(std::process::id());
+                }
+            }
+        });
+        Some(Tray { _icon: tray, _timer: timer })
+    }
+}
+
 fn wire_settings(ui: &AppWindow, core: &Shared) {
     let (c, w) = (core.clone(), ui.as_weak());
     ui.on_save_settings(move || {
@@ -3227,4 +4137,34 @@ fn wire_settings(ui: &AppWindow, core: &Shared) {
     ui.on_open_data_dir(move || {
         let _ = open::that(&c.lock().unwrap().paths.data);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{library_match, library_rank};
+
+    #[test]
+    fn library_match_hints() {
+        let packs = vec!["Space Age run".to_string(), "Vanilla+".to_string()];
+        let m = |f: &str| library_match(f, "bobinserters", "Bob's Adjustable Inserters", &packs, "Bobingabout").unwrap().1;
+        assert_eq!(m("bobins"), "ID : bobinserters");
+        assert_eq!(m("inserters"), "", "le titre affiche déjà le mot");
+        assert_eq!(m("space"), "Trouvé dans le modpack : Space Age run");
+        assert_eq!(m("gabout"), "Auteur : Bobingabout");
+    }
+
+    #[test]
+    fn library_rank_priorities() {
+        let packs = vec!["Space Age run".to_string()];
+        let r = |f: &str| library_rank(f, "bobinserters", "Bob's Adjustable Inserters", &packs, "Bobingabout");
+        assert_eq!(r(""), Some(0));
+        assert_eq!(r("bobinserters"), Some(0));
+        assert_eq!(r("bobins"), Some(1));
+        assert_eq!(r("inserters"), Some(2));
+        assert_eq!(r("adjustable"), Some(4));
+        assert_eq!(r("space"), Some(5));
+        assert_eq!(r("gabout"), Some(6));
+        assert_eq!(r("bob space"), Some(5), "tous les mots doivent correspondre");
+        assert_eq!(r("krastorio"), None);
+    }
 }

@@ -121,6 +121,7 @@ pub fn import(src: &Path, store: &Store, tmp_dir: &Path) -> Result<Imported> {
         mods: manifest.mods,
         disabled_builtins: manifest.disabled_builtins,
         saves: vec![],
+        history: vec![],
     };
     Ok(Imported { pack, settings, missing })
 }

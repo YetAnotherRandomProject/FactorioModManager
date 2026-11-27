@@ -55,12 +55,12 @@ pub fn acquire(data: &Path) -> Result<Instance> {
 
 /// Restaure et passe au premier plan la fenêtre principale du processus `pid`.
 #[cfg(windows)]
-fn activate(pid: u32) -> bool {
+pub fn activate(pid: u32) -> bool {
     win::activate(pid)
 }
 
 #[cfg(not(windows))]
-fn activate(_pid: u32) -> bool {
+pub fn activate(_pid: u32) -> bool {
     false
 }
 

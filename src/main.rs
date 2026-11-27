@@ -5,6 +5,7 @@ mod check;
 mod config;
 mod factorio;
 mod instance;
+mod journal;
 mod modpack;
 mod portal;
 mod store;

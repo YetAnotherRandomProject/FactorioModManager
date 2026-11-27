@@ -98,6 +98,56 @@ pub struct ModFull {
     pub source_url: Option<String>,
     #[serde(default)]
     pub releases: Vec<Release>,
+    #[serde(default)]
+    pub changelog: Option<String>,
+}
+
+/// Erreur passagère d'un téléchargement (réseau, serveur, fichier corrompu) : on réessaie.
+#[derive(Debug)]
+struct Transient(String);
+
+impl std::fmt::Display for Transient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Transient {}
+
+fn is_transient(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Transient>() || c.is::<reqwest::Error>() || c.is::<std::io::Error>())
+}
+
+/// Nombre de tentatives par téléchargement.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// Sections du changelog (format Factorio) postérieures à `since`, la plus récente en premier.
+pub fn changelog_since(text: &str, since: &Version) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut current: Option<(Version, Vec<&str>)> = None;
+    let flush = |cur: Option<(Version, Vec<&str>)>, out: &mut Vec<String>| {
+        if let Some((v, lines)) = cur {
+            if v > *since {
+                out.push(lines.join("\n").trim_end().to_string());
+            }
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t.chars().all(|c| c == '-') && !t.is_empty() {
+            continue; // séparateur entre versions
+        }
+        if let Some(v) = t.strip_prefix("Version:") {
+            flush(current.take(), &mut out);
+            current = Some((v.trim().parse().unwrap_or_default(), vec![t]));
+        } else if let Some((_, lines)) = current.as_mut() {
+            if !t.starts_with("Date:") {
+                lines.push(line.trim_end());
+            }
+        }
+    }
+    flush(current.take(), &mut out);
+    out.join("\n\n")
 }
 
 impl ModFull {
@@ -243,6 +293,7 @@ impl Portal {
     }
 
     /// Télécharge une release dans `dest_dir`, vérifie le SHA1 et renvoie le chemin du zip.
+    /// Les erreurs passagères (coupure réseau, erreur du serveur, SHA1 invalide) sont réessayées.
     pub fn download(
         &self,
         release: &Release,
@@ -250,6 +301,32 @@ impl Portal {
         token: &str,
         dest_dir: &Path,
         mut progress: impl FnMut(u64, u64),
+    ) -> Result<PathBuf> {
+        let mut attempt = 1;
+        loop {
+            match self.download_once(release, username, token, dest_dir, &mut progress) {
+                Ok(p) => return Ok(p),
+                Err(e) if attempt < DOWNLOAD_ATTEMPTS && is_transient(&e) => {
+                    crate::journal::log(format!(
+                        "Téléchargement de {} interrompu ({e:#}) : nouvel essai ({}/{DOWNLOAD_ATTEMPTS}).",
+                        release.file_name,
+                        attempt + 1
+                    ));
+                    std::thread::sleep(Duration::from_secs(2u64.pow(attempt)));
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn download_once(
+        &self,
+        release: &Release,
+        username: &str,
+        token: &str,
+        dest_dir: &Path,
+        progress: &mut impl FnMut(u64, u64),
     ) -> Result<PathBuf> {
         if username.is_empty() || token.is_empty() {
             bail!("identifiants du portail manquants (voir Paramètres)");
@@ -262,6 +339,9 @@ impl Portal {
             urlencode(token)
         );
         let mut resp = self.client.get(&url).send().context("téléchargement")?;
+        if resp.status().is_server_error() {
+            return Err(Transient(format!("le portail a répondu {}", resp.status())).into());
+        }
         if !resp.status().is_success() {
             bail!("téléchargement refusé ({}) pour {}", resp.status(), release.file_name);
         }
@@ -289,7 +369,7 @@ impl Portal {
         let digest: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
         if !release.sha1.is_empty() && !release.sha1.eq_ignore_ascii_case(&digest) {
             let _ = fs::remove_file(&tmp);
-            bail!("somme SHA1 invalide pour {}", release.file_name);
+            return Err(Transient(format!("somme SHA1 invalide pour {}", release.file_name)).into());
         }
         let dest = dest_dir.join(&release.file_name);
         fs::rename(&tmp, &dest)?;
@@ -410,6 +490,31 @@ pub fn search<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn changelog_since_keeps_newer_sections() {
+        let text = "---------------------------------------------------------------------------------------------------
+Version: 1.2.0
+Date: 2026-11-01
+  Features:
+    - Nouveau truc
+---------------------------------------------------------------------------------------------------
+Version: 1.1.0
+Date: 2026-10-01
+  Bugfixes:
+    - Correctif
+---------------------------------------------------------------------------------------------------
+Version: 1.0.0
+  Info:
+    - Première version
+";
+        let log = changelog_since(text, &"1.0.0".parse().unwrap());
+        assert!(log.starts_with("Version: 1.2.0"));
+        assert!(log.contains("Correctif"));
+        assert!(!log.contains("Première"));
+        assert!(!log.contains("Date:"));
+        assert!(changelog_since(text, &"1.2.0".parse().unwrap()).is_empty());
+    }
 
     /// Test réseau : télécharge un petit mod avec les identifiants de player-data.json.
     /// Lancer avec `cargo test -- --ignored download_real_mod`.

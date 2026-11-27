@@ -65,8 +65,32 @@ fn client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
+/// Exécutable installé par l'installateur NSIS (installation par utilisateur).
+#[cfg(target_os = "windows")]
+fn installed_exe() -> Option<PathBuf> {
+    let dir = std::env::var_os("LOCALAPPDATA")?;
+    let exe = PathBuf::from(dir).join("Factorio Mod Manager").join("FactorioModManager.exe");
+    exe.exists().then_some(exe)
+}
+
+/// Compilation locale (`cargo build`/`cargo run`) : l'installateur ne la remplacerait pas, la
+/// proposer en boucle n'a pas de sens.
+fn is_dev_build() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .is_some_and(|d| {
+            let leaf = d.file_name().and_then(|f| f.to_str()).unwrap_or("").to_lowercase();
+            let parent = d.parent().and_then(|p| p.file_name()).and_then(|f| f.to_str()).unwrap_or("").to_lowercase();
+            parent == "target" && (leaf == "debug" || leaf == "release")
+        })
+}
+
 /// Renvoie la dernière release si elle est plus récente que la version en cours.
 pub fn check() -> Result<Option<AppRelease>> {
+    if is_dev_build() {
+        return Ok(None);
+    }
     let resp = client()?
         .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
         .header("Accept", "application/vnd.github+json")
@@ -129,7 +153,9 @@ pub fn install(file: &Path) -> Result<bool> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let exe = std::env::current_exe()?;
+        // On relance la copie installée : l'exécutable en cours peut être ailleurs (copie portable),
+        // et le relancer ramènerait l'ancienne version, qui proposerait de nouveau la mise à jour.
+        let exe = installed_exe().map(Ok).unwrap_or_else(std::env::current_exe)?;
         let script = file.with_extension("cmd");
         // Attend la fermeture de l'app, installe en silencieux, puis relance.
         let body = format!(
